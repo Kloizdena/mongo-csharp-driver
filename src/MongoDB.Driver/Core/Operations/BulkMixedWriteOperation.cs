@@ -31,8 +31,11 @@ namespace MongoDB.Driver.Core.Operations
         private bool? _bypassDocumentValidation;
         private readonly CollectionNamespace _collectionNamespace;
         private BsonValue _comment;
+        private bool _enableOverloadRetargeting;
+        private readonly bool _isOperationRetryable;
         private bool _isOrdered = true;
         private BsonDocument _let;
+        private int _maxAdaptiveRetries;
         private int? _maxBatchCount;
         private int? _maxBatchLength;
         private int? _maxDocumentSize;
@@ -60,6 +63,7 @@ namespace MongoDB.Driver.Core.Operations
         {
             _collectionNamespace = Ensure.IsNotNull(collectionNamespace, nameof(collectionNamespace));
             _requests = Ensure.IsNotNull(requests, nameof(requests));
+            _isOperationRetryable = _requests.All(r => r.IsRetryable());
             _messageEncoderSettings = Ensure.IsNotNull(messageEncoderSettings, nameof(messageEncoderSettings));
             _operationName = operationName;
             _writeConcern = WriteConcern.Acknowledged;
@@ -82,6 +86,12 @@ namespace MongoDB.Driver.Core.Operations
             set { _comment = value; }
         }
 
+        public bool EnableOverloadRetargeting
+        {
+            get { return _enableOverloadRetargeting; }
+            set { _enableOverloadRetargeting = value; }
+        }
+
         public bool IsOrdered
         {
             get { return _isOrdered; }
@@ -92,6 +102,12 @@ namespace MongoDB.Driver.Core.Operations
         {
             get { return _let; }
             set { _let = value; }
+        }
+
+        public int MaxAdaptiveRetries
+        {
+            get { return _maxAdaptiveRetries; }
+            set { _maxAdaptiveRetries = value; }
         }
 
         public int? MaxBatchCount
@@ -136,6 +152,8 @@ namespace MongoDB.Driver.Core.Operations
             set { _retryRequested = value; }
         }
 
+        public bool IsOperationRetryable => _isOperationRetryable;
+
         public WriteConcern WriteConcern
         {
             get { return _writeConcern; }
@@ -145,9 +163,8 @@ namespace MongoDB.Driver.Core.Operations
         public BulkWriteOperationResult Execute(OperationContext operationContext, IWriteBinding binding)
         {
             using (BeginOperation())
-            using (var context = RetryableWriteContext.Create(operationContext, binding, IsOperationRetryable()))
+            using (var context = new RetryableWriteContext(binding, _retryRequested, _maxAdaptiveRetries, _enableOverloadRetargeting))
             {
-                EnsureHintIsSupportedIfAnyRequestHasHint();
                 var helper = new BatchHelper(_requests, _isOrdered, _writeConcern);
                 foreach (var batch in helper.GetBatches())
                 {
@@ -160,9 +177,8 @@ namespace MongoDB.Driver.Core.Operations
         public async Task<BulkWriteOperationResult> ExecuteAsync(OperationContext operationContext, IWriteBinding binding)
         {
             using (BeginOperation())
-            using (var context = await RetryableWriteContext.CreateAsync(operationContext, binding, IsOperationRetryable()).ConfigureAwait(false))
+            using (var context = new RetryableWriteContext(binding, _retryRequested, _maxAdaptiveRetries, _enableOverloadRetargeting))
             {
-                EnsureHintIsSupportedIfAnyRequestHasHint();
                 var helper = new BatchHelper(_requests, _isOrdered, _writeConcern);
                 foreach (var batch in helper.GetBatches())
                 {
@@ -171,9 +187,6 @@ namespace MongoDB.Driver.Core.Operations
                 return helper.GetFinalResultOrThrow(context.Channel.ConnectionDescription.ConnectionId);
             }
         }
-
-        private bool IsOperationRetryable()
-            => _retryRequested && _requests.All(r => r.IsRetryable());
 
         private EventContext.OperationIdDisposer BeginOperation() =>
             // Execution starts with the first request
@@ -234,17 +247,6 @@ namespace MongoDB.Driver.Core.Operations
                 case WriteRequestType.Insert: return CreateBulkInsertOperation(batch);
                 case WriteRequestType.Update: return CreateBulkUpdateOperation(batch);
                 default: throw new ArgumentException("Invalid batch type.", nameof(batch));
-            }
-        }
-
-        private void EnsureHintIsSupportedIfAnyRequestHasHint()
-        {
-            foreach (var request in _requests)
-            {
-                if (RequestHasHint(request) && !_writeConcern.IsAcknowledged)
-                {
-                    throw new NotSupportedException("Hint is not supported for unacknowledged writes.");
-                }
             }
         }
 

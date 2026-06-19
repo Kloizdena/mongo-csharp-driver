@@ -61,6 +61,7 @@ namespace MongoDB.Driver.Search
         private readonly List<SearchDefinition<TDocument>> _must;
         private readonly List<SearchDefinition<TDocument>> _mustNot;
         private readonly List<SearchDefinition<TDocument>> _should;
+        private readonly string[] _doesNotAffect;
 
         public CompoundSearchDefinition(
             List<SearchDefinition<TDocument>> must,
@@ -68,6 +69,7 @@ namespace MongoDB.Driver.Search
             List<SearchDefinition<TDocument>> should,
             List<SearchDefinition<TDocument>> filter,
             int minimumShouldMatch,
+            IEnumerable<string> doesNotAffect,
             SearchScoreDefinition<TDocument> score)
                 : base(OperatorType.Compound, score)
         {
@@ -77,6 +79,7 @@ namespace MongoDB.Driver.Search
             _should = should;
             _filter = filter;
             _minimumShouldMatch = minimumShouldMatch;
+            _doesNotAffect = doesNotAffect?.ToArray();
         }
 
         private protected override BsonDocument RenderArguments(
@@ -90,6 +93,7 @@ namespace MongoDB.Driver.Search
                 { "should", Render(_should), _should != null },
                 { "filter", Render(_filter), _filter != null },
                 { "minimumShouldMatch", _minimumShouldMatch, _minimumShouldMatch > 0 },
+                { "doesNotAffect", () => new BsonArray(_doesNotAffect), _doesNotAffect is { Length: > 0 } }
             };
 
             Func<BsonArray> Render(List<SearchDefinition<TDocument>> searchDefinitions) =>
@@ -123,14 +127,34 @@ namespace MongoDB.Driver.Search
         }
     }
 
+    /// <summary>
+    /// Options for the equals search operator.
+    /// </summary>
+    /// <typeparam name="TDocument">The type of the document.</typeparam>
+    public struct EqualsSearchOperatorOptions<TDocument>
+    {
+        /// <summary>
+        /// Gets or sets the names of the facets whose counts this operator should not restrict.
+        /// Those facets reflect the full result set regardless of the operator's filter.
+        /// </summary>
+        public IEnumerable<string> DoesNotAffect { get; set; }
+
+        /// <summary>
+        /// Gets or sets the score modifier.
+        /// </summary>
+        public SearchScoreDefinition<TDocument> Score { get; set; }
+    }
+
     internal sealed class EqualsSearchDefinition<TDocument, TField> : OperatorSearchDefinition<TDocument>
     {
         private readonly TField _value;
+        private readonly string[] _doesNotAffect;
 
-        public EqualsSearchDefinition(FieldDefinition<TDocument> path, TField value, SearchScoreDefinition<TDocument> score)
-            : base(OperatorType.Equals, path, score)
+        public EqualsSearchDefinition(FieldDefinition<TDocument> path, TField value, EqualsSearchOperatorOptions<TDocument> options)
+            : base(OperatorType.Equals, path, options.Score)
         {
             _value = value;
+            _doesNotAffect = options.DoesNotAffect?.Select(f => Ensure.IsNotNullOrEmpty(f, "DoesNotAffect")).ToArray();
         }
 
         private protected override BsonDocument RenderArguments(
@@ -154,7 +178,11 @@ namespace MongoDB.Driver.Search
                 serializedValue = ToBsonValue(_value);
             }
 
-            return new BsonDocument("value", serializedValue);
+            return new BsonDocument
+            {
+                { "value", serializedValue },
+                { "doesNotAffect", () => new BsonArray(_doesNotAffect), _doesNotAffect is { Length: > 0 } }
+            };
         }
     }
 
@@ -174,8 +202,8 @@ namespace MongoDB.Driver.Search
         public FacetSearchDefinition(SearchDefinition<TDocument> @operator, IEnumerable<SearchFacet<TDocument>> facets)
             : base(OperatorType.Facet)
         {
-            _operator = Ensure.IsNotNull(@operator, nameof(@operator));
-            _facets = Ensure.IsNotNull(facets, nameof(facets)).ToArray();
+            _operator = @operator;
+            _facets = Ensure.IsNotNullOrEmpty(facets, nameof(facets)).ToArray();
         }
 
         private protected override BsonDocument RenderArguments(
@@ -183,7 +211,7 @@ namespace MongoDB.Driver.Search
             IBsonSerializer fieldSerializer) =>
             new()
             {
-                { "operator", _operator.Render(args) },
+                { "operator", () => _operator.Render(args), _operator != null },
                 { "facets", new BsonDocument(_facets.Select(f => new BsonElement(f.Name, f.Render(args)))) }
             };
     }
@@ -235,18 +263,84 @@ namespace MongoDB.Driver.Search
             new(_area.Render());
     }
 
+    internal sealed class HasAncestorSearchDefinition<TDocument> : OperatorSearchDefinition<TDocument>
+    {
+        private readonly FieldDefinition<TDocument> _ancestorPath;
+        private readonly SearchDefinition<TDocument> _operator;
+
+        public HasAncestorSearchDefinition(
+            FieldDefinition<TDocument> ancestorPath,
+            SearchDefinition<TDocument> @operator,
+            SearchScoreDefinition<TDocument> score)
+            : base(OperatorType.HasAncestor, score)
+        {
+            _ancestorPath = Ensure.IsNotNull(ancestorPath, nameof(ancestorPath));
+            _operator = Ensure.IsNotNull(@operator, nameof(@operator));
+        }
+
+        private protected override BsonDocument RenderArguments(
+            RenderArgs<TDocument> args,
+            IBsonSerializer fieldSerializer)
+            => new()
+            {
+                { "ancestorPath", _ancestorPath.Render(args).FieldName },
+                { "operator", _operator.Render(args with { PathRenderArgs = args.PathRenderArgs with { PathPrefix = null } }) }
+            };
+    }
+
+    internal sealed class HasRootSearchDefinition<TDocument> : OperatorSearchDefinition<TDocument>
+    {
+        private readonly SearchDefinition<TDocument> _operator;
+
+        public HasRootSearchDefinition(
+            SearchDefinition<TDocument> @operator,
+            SearchScoreDefinition<TDocument> score)
+            : base(OperatorType.HasRoot, score)
+        {
+            _operator = Ensure.IsNotNull(@operator, nameof(@operator));
+        }
+
+        private protected override BsonDocument RenderArguments(
+            RenderArgs<TDocument> args,
+            IBsonSerializer fieldSerializer)
+            => new()
+            {
+                { "operator", _operator.Render(args with { PathRenderArgs = args.PathRenderArgs with { PathPrefix = null } }) }
+            };
+    }
+
+    /// <summary>
+    /// Options for the in search operator.
+    /// </summary>
+    /// <typeparam name="TDocument">The type of the document.</typeparam>
+    public struct InSearchOperatorOptions<TDocument>
+    {
+        /// <summary>
+        /// Gets or sets the names of the facets whose counts this operator should not restrict.
+        /// Those facets reflect the full result set regardless of the operator's filter.
+        /// </summary>
+        public IEnumerable<string> DoesNotAffect { get; set; }
+
+        /// <summary>
+        /// Gets or sets the score modifier.
+        /// </summary>
+        public SearchScoreDefinition<TDocument> Score { get; set; }
+    }
+
     internal sealed class InSearchDefinition<TDocument, TField> : OperatorSearchDefinition<TDocument>
     {
         private readonly TField[] _values;
+        private readonly string[] _doesNotAffect;
 
         public InSearchDefinition(
            SearchPathDefinition<TDocument> path,
            IEnumerable<TField> values,
-           SearchScoreDefinition<TDocument> score)
-                : base(OperatorType.In, path, score)
+           InSearchOperatorOptions<TDocument> options)
+                : base(OperatorType.In, path, options.Score)
         {
             Ensure.IsNotNullOrEmpty(values, nameof(values));
             _values = values.ToArray();
+            _doesNotAffect = options.DoesNotAffect?.Select(f => Ensure.IsNotNullOrEmpty(f, "DoesNotAffect")).ToArray();
         }
 
         private protected override BsonDocument RenderArguments(
@@ -270,7 +364,11 @@ namespace MongoDB.Driver.Search
                 serializedValues = new BsonArray(_values.Select(ToBsonValue));
             }
 
-            return new BsonDocument("value", serializedValues);
+            return new BsonDocument
+            {
+                { "value", serializedValues },
+                { "doesNotAffect", () => new BsonArray(_doesNotAffect), _doesNotAffect is { Length: > 0 } }
+            };
         }
     }
 
@@ -372,17 +470,37 @@ namespace MongoDB.Driver.Search
             };
     }
 
+    /// <summary>
+    /// Options for the range search operator.
+    /// </summary>
+    /// <typeparam name="TDocument">The type of the document.</typeparam>
+    public struct RangeSearchOperatorOptions<TDocument>
+    {
+        /// <summary>
+        /// Gets or sets the names of the facets whose counts this operator should not restrict.
+        /// Those facets reflect the full result set regardless of the operator's filter.
+        /// </summary>
+        public IEnumerable<string> DoesNotAffect { get; set; }
+
+        /// <summary>
+        /// Gets or sets the score modifier.
+        /// </summary>
+        public SearchScoreDefinition<TDocument> Score { get; set; }
+    }
+
     internal sealed class RangeSearchDefinition<TDocument, TField> : OperatorSearchDefinition<TDocument>
     {
         private readonly SearchRangeV2<TField> _range;
+        private readonly string[] _doesNotAffect;
 
         public RangeSearchDefinition(
             SearchPathDefinition<TDocument> path,
             SearchRangeV2<TField> range,
-            SearchScoreDefinition<TDocument> score)
-                : base(OperatorType.Range, path, score)
+            RangeSearchOperatorOptions<TDocument> options)
+                : base(OperatorType.Range, path, options.Score)
         {
             _range = range;
+            _doesNotAffect = options.DoesNotAffect?.Select(f => Ensure.IsNotNullOrEmpty(f, "DoesNotAffect")).ToArray();
         }
 
         private protected override BsonDocument RenderArguments(
@@ -415,7 +533,8 @@ namespace MongoDB.Driver.Search
             return new BsonDocument
             {
                 { minInclusive ? "gte" : "gt", serializedMin, serializedMin != null },
-                { maxInclusive ? "lte" : "lt", serializedMax, serializedMax != null }
+                { maxInclusive ? "lte" : "lt", serializedMax, serializedMax != null },
+                { "doesNotAffect", () => new BsonArray(_doesNotAffect), _doesNotAffect is { Length: > 0 } }
             };
         }
     }

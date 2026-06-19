@@ -14,6 +14,7 @@
 */
 
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Linq.Expressions;
 using MongoDB.Bson.Serialization;
@@ -64,7 +65,7 @@ namespace MongoDB.Driver.Linq.Linq3Implementation.Translators
 
         public static TranslationContext Create(
             Expression expression,
-            (Expression Node, IBsonSerializer Serializer)[] initialNodeSerializers,
+            IEnumerable<(Expression Node, IBsonSerializer Serializer)> initialNodeSerializers,
             ExpressionTranslationOptions translationOptions,
             TranslationContextData data = null)
         {
@@ -77,7 +78,7 @@ namespace MongoDB.Driver.Linq.Linq3Implementation.Translators
             return Create(translationOptions, nodeSerializers, data);
         }
 
-        public static TranslationContext Create(
+        private static TranslationContext Create(
             ExpressionTranslationOptions translationOptions,
             IReadOnlySerializerMap nodeSerializers,
             TranslationContextData data = null)
@@ -87,7 +88,7 @@ namespace MongoDB.Driver.Linq.Linq3Implementation.Translators
             return new TranslationContext(translationOptions, nodeSerializers, data, symbolTable, nameGenerator);
         }
 
-        private static Expression GetUltimateSource(Expression expression)
+        internal static Expression GetUltimateSource(Expression expression)
         {
             if (expression is ConstantExpression constantExpression &&
                 constantExpression.Value is IQueryable queryable &&
@@ -183,6 +184,13 @@ namespace MongoDB.Driver.Linq.Linq3Implementation.Translators
         public Symbol CreateSymbol(ParameterExpression parameter, string name, AstExpression ast, IBsonSerializer serializer, bool isCurrent = false)
         {
             return new Symbol(parameter, name, ast, serializer, isCurrent);
+        }
+
+        public Symbol CreateSymbolWithGeneratedVarName(ParameterExpression parameter, IBsonSerializer serializer, bool isCurrent = false)
+        {
+            var parameterName = _nameGenerator.GetParameterName(parameter);
+            var varName = _nameGenerator.GenerateVarName();
+            return CreateSymbol(parameter, name: parameterName, varName, serializer, isCurrent);
         }
 
         public Symbol CreateSymbolWithVarName(ParameterExpression parameter, string varName, IBsonSerializer serializer, bool isCurrent = false)

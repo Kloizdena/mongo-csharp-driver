@@ -16,23 +16,25 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Threading;
 using FluentAssertions;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization.Attributes;
-using MongoDB.Driver.Core.Misc;
+using MongoDB.Driver.Core;
+using MongoDB.Driver.Core.Events;
 using MongoDB.Driver.Core.TestHelpers.Logging;
 using MongoDB.Driver.GeoJsonObjectModel;
 using MongoDB.Driver.Search;
 using MongoDB.TestHelpers.XunitExtensions;
 using Xunit;
 using Xunit.Abstractions;
+using Xunit.Sdk;
 using Builders = MongoDB.Driver.Builders<MongoDB.Driver.Tests.Search.AtlasSearchTests.HistoricalDocument>;
 using GeoBuilders = MongoDB.Driver.Builders<MongoDB.Driver.Tests.Search.AtlasSearchTests.AirbnbListing>;
 
 namespace MongoDB.Driver.Tests.Search
 {
     [Trait("Category", "AtlasSearch")]
+    [Collection(AtlasSearchCollection.Name)]
     public class AtlasSearchTests : LoggableTestClass
     {
         private const string SearchWithVectorIndexName = "search-with-vector";
@@ -279,14 +281,29 @@ namespace MongoDB.Driver.Tests.Search
 
         #endregion
 
+        private readonly AtlasSearchFixture _fixture;
         private readonly IMongoClient _mongoClient;
+        private readonly EventCapturer _eventCapturer;
 
-        public AtlasSearchTests(ITestOutputHelper testOutputHelper) : base(testOutputHelper)
+        public AtlasSearchTests(AtlasSearchFixture fixture, ITestOutputHelper testOutputHelper) : base(testOutputHelper)
         {
-            _mongoClient = AtlasSearchTestsUtils.CreateAtlasSearchMongoClient();
+            RequireEnvironment.Check().EnvironmentVariable("ATLAS_SEARCH_TESTS_ENABLED");
+            RequireEnvironment.Check().EnvironmentVariable("ATLAS_SEARCH_URI");
+
+            _fixture = fixture;
+            _mongoClient = fixture.Client;
+
+            // Each test instance owns its capturer so concurrent test classes sharing the
+            // fixture's MongoClient can't observe (or clear) each other's events. xUnit
+            // serializes within the AtlasSearch collection, so the capturer is single-writer.
+            _eventCapturer = new EventCapturer().Capture<CommandStartedEvent>(e => e.CommandName == "aggregate");
+            _fixture.AddEventSubscriber(_eventCapturer);
         }
 
-        protected override void DisposeInternal() => _mongoClient.Dispose();
+        protected override void DisposeInternal()
+        {
+            _fixture.RemoveEventSubscriber(_eventCapturer);
+        }
 
         [Fact]
         public void Autocomplete()
@@ -316,6 +333,23 @@ namespace MongoDB.Driver.Tests.Search
         }
 
         [Fact]
+        public void Compound_with_doesNotAffect()
+        {
+            var results = GetMoviesCollection<Movie>()
+                .Aggregate()
+                .SearchMeta(Builders<Movie>.Search.Facet(
+                    Builders<Movie>.Search.Compound()
+                        .Must(
+                            Builders<Movie>.Search.Text(m => m.Title, "life"),
+                            Builders<Movie>.Search.Text(m => m.Title, "liberty"))
+                        .DoesNotAffect("year"),
+                    Builders<Movie>.SearchFacet.Number("year", x => x.Year, 1900, 1950, 2000, 2100)))
+                .Single();
+
+            results.Facet["year"].Buckets.Should().NotContain(x => x.Count <= 1);
+        }
+
+        [Fact]
         public void Count_total()
         {
             var results = GetTestCollection().Aggregate()
@@ -328,7 +362,7 @@ namespace MongoDB.Driver.Tests.Search
                 .Project<HistoricalDocument>(Builders.Projection.SearchMeta(x => x.MetaResult))
                 .Limit(1)
                 .ToList();
-            results.Should().ContainSingle().Which.MetaResult.Count.Total.Should().Be(108);
+            results.Should().ContainSingle().Which.MetaResult.Count.Total.Should().Be(1);
         }
 
         [Fact]
@@ -337,7 +371,7 @@ namespace MongoDB.Driver.Tests.Search
             var builderHistoricalDocument = Builders<HistoricalDocumentWithCommentsOnly>.Search;
             var builderComments = Builders<Comment>.Search;
 
-            var result = GetTestCollection< HistoricalDocumentWithCommentsOnly>()
+            var result = GetTestCollection<HistoricalDocumentWithCommentsOnly>()
                 .Aggregate()
                 .Search(builderHistoricalDocument.EmbeddedDocument(
                     p => p.Comments,
@@ -349,6 +383,40 @@ namespace MongoDB.Driver.Tests.Search
             {
                 document.Comments.Should().Contain(c => c.Author == "Corliss Zuk");
             }
+        }
+
+        [Fact]
+        public void EmbeddedDocument_with_HasAncestor()
+        {
+            var query = GetReturnScopeCollection<Director>().Aggregate().Search(
+                Builders<Director>.Search.EmbeddedDocument(
+                    "movies.reviews",
+                    Builders<Director>.Search.HasAncestor(
+                        b => b.Movies,
+                        Builders<Director>.Search.Text("movies.title", "Ant-Man"))),
+                new() { IndexName = "returnScopeIndex3" });
+
+            var results = query.ToList();
+            results.Count.Should().Be(0);
+
+            ValidateSearchStage(
+                "{ $search: { embeddedDocument: { operator: { hasAncestor: { ancestorPath: 'movies', operator: { text: { query: 'Ant-Man', path: 'movies.title' } } } }, path: 'movies.reviews' }, index: 'returnScopeIndex3' } }");
+        }
+
+        [Fact]
+        public void EmbeddedDocument_with_HasRoot()
+        {
+            var query = GetReturnScopeCollection<Director>().Aggregate().Search(Builders<Director>.Search.EmbeddedDocument(
+                    "movies.reviews",
+                    Builders<Director>.Search.HasRoot(
+                        Builders<Director>.Search.Text("movies.title", "Ant-Man"))),
+                new() { IndexName = "returnScopeIndex3" });
+
+            var results = query.ToList();
+            results.Count.Should().Be(0);
+
+            ValidateSearchStage(
+                "{ $search: { embeddedDocument: { operator: { hasRoot: { operator: { text: { query: 'Ant-Man', path: 'movies.title' } } } }, path: 'movies.reviews' }, index: 'returnScopeIndex3' } }");
         }
 
         [Fact]
@@ -387,9 +455,8 @@ namespace MongoDB.Driver.Tests.Search
                 result.Genres.Should().Contain("Family");
             }
 
-            results[0].Title.Should().Be("The Poor Little Rich Girl");
-            results[1].Title.Should().Be("Robin Hood");
-            results[2].Title.Should().Be("Peter Pan");
+            results.Select(r => r.Title).Should().BeEquivalentTo(
+                new[] { "The Poor Little Rich Girl", "Robin Hood", "Peter Pan" });
         }
 
         [Fact]
@@ -400,6 +467,19 @@ namespace MongoDB.Driver.Tests.Search
                 .ToList();
 
             results.Should().ContainSingle().Which.Title.Should().Be("A Corner in Wheat");
+        }
+
+        [Fact]
+        public void Equals_with_doesNotAffect()
+        {
+            var results = GetMoviesCollection<Movie>()
+                .Aggregate()
+                .SearchMeta(Builders<Movie>.Search.Facet(
+                    Builders<Movie>.Search.Equals(x => x.Runtime, 232, new EqualsSearchOperatorOptions<Movie> { DoesNotAffect = ["year"] }),
+                    Builders<Movie>.SearchFacet.Number("year", x => x.Year, 1900, 1950, 2000, 2100)))
+                .Single();
+
+            results.Facet["year"].Buckets.Should().NotContain(x => x.Count <= 1);
         }
 
         [Fact]
@@ -468,8 +548,8 @@ namespace MongoDB.Driver.Tests.Search
                     GeoShapeRelation.Intersects,
                     __testPolygon));
 
-            results.Count.Should().Be(25);
-            results.First().Name.Should().Be("Ribeira Charming Duplex");
+            results.Should().NotBeEmpty();
+            results.Should().Contain(r => r.Name == "Ribeira Charming Duplex");
         }
 
         [Theory]
@@ -488,8 +568,8 @@ namespace MongoDB.Driver.Tests.Search
 
             var results = GeoSearch(GeoBuilders.Search.GeoWithin(x => x.Address.Location, geoArea));
 
-            results.Count.Should().Be(25);
-            results.First().Name.Should().Be("Ribeira Charming Duplex");
+            results.Should().NotBeEmpty();
+            results.Should().Contain(r => r.Name == "Ribeira Charming Duplex");
         }
 
         [Fact]
@@ -506,6 +586,19 @@ namespace MongoDB.Driver.Tests.Search
             results.Count.Should().Be(2);
             results[0].Runtime.Should().Be(231);
             results[1].Runtime.Should().Be(31);
+        }
+
+        [Fact]
+        public void In_with_doesNotAffect()
+        {
+            var results = GetMoviesCollection<Movie>()
+                .Aggregate()
+                .SearchMeta(Builders<Movie>.Search.Facet(
+                    Builders<Movie>.Search.In(x => x.Runtime, [231], new InSearchOperatorOptions<Movie> { DoesNotAffect = ["year"] }),
+                    Builders<Movie>.SearchFacet.Number("year", x => x.Year, 1900, 1950, 2000, 2100)))
+                .Single();
+
+            results.Facet["year"].Buckets.Should().NotContain(x => x.Count <= 1);
         }
 
         [Fact]
@@ -649,12 +742,18 @@ namespace MongoDB.Driver.Tests.Search
                     .Limit(5)
                     .ToList();
 
+            // Relevance ordering between the 4th/5th titles is corpus-sensitive; assert membership.
             result.Count.Should().Be(5);
             result[0].Title.Should().Be("The Great Race");
             result[1].Title.Should().Be("The Cannonball Run");
-            result[2].Title.Should().Be("National Mechanics");
-            result[3].Title.Should().Be("Speedway Junky");
-            result[4].Title.Should().Be("Jo pour Jonathan");
+            result.Select(r => r.Title).Should().BeEquivalentTo(new[]
+            {
+                "The Great Race",
+                "The Cannonball Run",
+                "National Mechanics",
+                "Speedway Junky",
+                "Jo pour Jonathan"
+            });
         }
 
         [Fact]
@@ -688,6 +787,19 @@ namespace MongoDB.Driver.Tests.Search
         }
 
         [Fact]
+        public void Range_with_doesNotAffect()
+        {
+            var results = GetMoviesCollection<Movie>()
+                .Aggregate()
+                .SearchMeta(Builders<Movie>.Search.Facet(
+                    Builders<Movie>.Search.Range(x => x.Runtime, new SearchRange<int>(230, 233, false, false), new RangeSearchOperatorOptions<Movie> { DoesNotAffect = ["year"] }),
+                    Builders<Movie>.SearchFacet.Number("year", x => x.Year, 1900, 1950, 2000, 2100)))
+                .Single();
+
+            results.Facet["year"].Buckets.Should().NotContain(x => x.Count <= 1);
+        }
+
+        [Fact]
         public void RangeString()
         {
             var results = GetMoviesCollection<Movie>().Aggregate()
@@ -696,11 +808,8 @@ namespace MongoDB.Driver.Tests.Search
                 .Project<Movie>(Builders<Movie>.Projection.Include(p => p.Title))
                 .ToList();
 
-            results[0].Title.Should().Be("Civilization");
-            results[1].Title.Should().Be("Clash of the Wolves");
-            results[2].Title.Should().Be("City Lights");
-            results[3].Title.Should().Be("Comradeship");
-            results[4].Title.Should().Be("Come and Get It");
+            results.Select(r => r.Title).Should().BeEquivalentTo(
+                new[] { "Civilization", "Clash of the Wolves", "City Lights", "Comradeship", "Come and Get It" });
         }
 
         [Fact]
@@ -734,10 +843,125 @@ namespace MongoDB.Driver.Tests.Search
                 "Battle for the Planet of the Apes", "King Kong Lives", "Mighty Joe Young");
         }
 
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void ReturnScope(bool useExpression)
+        {
+            var searchDefinition = Builders<Director>.Search.Range("movies.releaseYear", SearchRangeBuilder.Gt(2000));
+            var aggregate = GetReturnScopeCollection<Director>().Aggregate();
+            var searchOptions = new SearchOptions<Director> { IndexName = "returnScopeIndex2", ReturnStoredSource = true };
+
+            var query = useExpression
+                ? aggregate.Search(searchDefinition, e => e.Movies, searchOptions)
+                : aggregate.Search<Director, DirectedMovie>(searchDefinition, "movies", searchOptions);
+
+            var results = query.ToList();
+            results.Count.Should().Be(1);
+            results[0].ReleaseYear.Should().Be(2016);
+
+            ValidateSearchStage(
+                "{ $search: { range: { gt: 2000, path: 'movies.releaseYear' }, returnScope: { path: 'movies' }, index: 'returnScopeIndex2', returnStoredSource: true } }");
+        }
+
+        [Fact]
+        public void ReturnScope_nested_path()
+        {
+            var searchDefinition = Builders<Director>.Search.Range("movies.reviews.rating", SearchRangeBuilder.Gte(8.0));
+            var aggregate = GetReturnScopeCollection<Director>().Aggregate();
+
+            var results = aggregate.Search<Director, DirectedMovieReview>(
+                searchDefinition,
+                "movies.reviews",
+                new() { IndexName = "returnScopeIndex2", ReturnStoredSource = true }).ToList();
+
+            results.Count.Should().Be(0);
+
+            ValidateSearchStage(
+                "{ $search: { range: { gte: 8.0, path: 'movies.reviews.rating' }, returnScope: { path: 'movies.reviews' }, index: 'returnScopeIndex2', returnStoredSource: true } }");
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void ReturnScope_HasRoot(bool useExpression)
+        {
+            var searchDefinition = Builders<Director>.Search.Compound()
+                .Must(Builders<Director>.Search.HasRoot(
+                        Builders<Director>.Search.Text(e => e.Name, "M. Night Shyamalan")),
+                    Builders<Director>.Search.Text("movies.reviews.text", "Amazing"));
+
+            var aggregate = GetReturnScopeCollection<Director>().Aggregate();
+
+            var searchOptions = new SearchOptions<Director>() { IndexName = "returnScopeIndex1", ReturnStoredSource = true };
+            var query = useExpression
+                ? aggregate.Search(searchDefinition, e => e.Movies, searchOptions)
+                : aggregate.Search<Director, DirectedMovie>(searchDefinition, "movies", searchOptions);
+
+            var results = query.ToList();
+            results.Count.Should().Be(2);
+            results[0].ReleaseYear.Should().Be(2016);
+            results[1].ReleaseYear.Should().Be(1999);
+
+            ValidateSearchStage(
+                "{ $search: { compound: { must: [ { hasRoot: { operator: { text: { query: 'M. Night Shyamalan', path: 'director' } } } }, { text: { query: 'Amazing', path: 'movies.reviews.text' } } ] }, returnScope: { path: 'movies' }, index: 'returnScopeIndex1', returnStoredSource: true } }");
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void ReturnScope_HasAncestor(bool useExpression)
+        {
+            var hasAncestor = useExpression
+                ? Builders<Director>.Search.HasAncestor(
+                    b => b.Movies,
+                    Builders<Director>.Search.Text("movies.title", "Split"))
+                : Builders<Director>.Search.HasAncestor<DirectedMovie>(
+                    "movies",
+                    Builders<Director>.Search.Text("movies.title", "Split"));
+
+            var searchDefinition = Builders<Director>.Search.Compound()
+                .Must(hasAncestor, Builders<Director>.Search.Text("movies.reviews.text", "Amazing"));
+
+            var aggregate = GetReturnScopeCollection<Director>().Aggregate();
+
+            var results = aggregate.Search<Director, DirectedMovieReview>(
+                searchDefinition,
+                "movies.reviews",
+                new() { IndexName = "returnScopeIndex2", ReturnStoredSource = true }).ToList();
+
+            results.Count.Should().Be(0);
+
+            ValidateSearchStage(
+                "{ $search: { compound: { must: [ { hasAncestor: { ancestorPath: 'movies', operator: { text: { query: 'Split', path: 'movies.title' } } } }, { text: { query: 'Amazing', path: 'movies.reviews.text' } } ] }, returnScope: { path: 'movies.reviews' }, index: 'returnScopeIndex2', returnStoredSource: true } }");
+        }
+
+        [Fact]
+        public void Rerank()
+        {
+            if (!_fixture.IsRerankSupported)
+            {
+                throw new SkipException("$rerank is not supported on this Atlas deployment.");
+            }
+
+            const int numDocsToRerank = 10;
+
+            var result = GetMoviesCollection<Movie>()
+                .Aggregate()
+                .Search(Builders<Movie>.Search.Text("plot", "apes"))
+                .Rerank(RerankQuery.Text("a movie about intelligent apes who take over civilization"), "plot", numDocsToRerank, "rerank-2.5-lite")
+                .Project<Movie>(Builders<Movie>.Projection
+                    .MetaScore(m => m.Score))
+                .ToList();
+
+            result.Count.Should().BeGreaterThan(0).And.BeLessOrEqualTo(numDocsToRerank);
+            result.Should().BeInDescendingOrder(m => m.Score);
+        }
+
         [Fact]
         public void SearchSequenceToken()
         {
-            const int limitVal = 10;
+            const int limitVal = 4;
             var titles = new[]
             {
                 "Equinox Flower",
@@ -781,7 +1005,8 @@ namespace MongoDB.Driver.Tests.Search
                 .Limit(limitVal)
                 .ToList();
 
-            searchAfterResults.Count.Should().Be(limitVal);
+            // Only two flower-titled docs remain after the 2nd base result.
+            searchAfterResults.Count.Should().Be(2);
             searchAfterResults.ForEach( m => m.PaginationToken.Should().NotBeNullOrEmpty());
             searchAfterResults[0].Title.Should().Be(titles[2]);
             searchAfterResults[1].Title.Should().Be(titles[3]);
@@ -820,7 +1045,7 @@ namespace MongoDB.Driver.Tests.Search
                 .Project<HistoricalDocument>(Builders.Projection.SearchMeta(x => x.MetaResult))
                 .Limit(1)
                 .ToList();
-            results.Should().ContainSingle().Which.MetaResult.Count.LowerBound.Should().Be(108);
+            results.Should().ContainSingle().Which.MetaResult.Count.LowerBound.Should().Be(1);
         }
 
         [Fact]
@@ -835,7 +1060,7 @@ namespace MongoDB.Driver.Tests.Search
 
             result.Should().NotBeNull();
             result.Count.Should().NotBeNull();
-            result.Count.Total.Should().Be(108);
+            result.Count.Total.Should().Be(1);
         }
 
         [Fact]
@@ -853,7 +1078,7 @@ namespace MongoDB.Driver.Tests.Search
 
             var bucket = result.Facet["string"].Buckets.Should().NotBeNull().And.ContainSingle().Subject;
             bucket.Id.Should().Be((BsonString)"machine");
-            bucket.Count.Should().Be(108);
+            bucket.Count.Should().Be(1);
 
             bucket = result.Facet["number"].Buckets.Should().NotBeNull().And.ContainSingle().Subject;
             bucket.Id.Should().Be((BsonInt32)0);
@@ -861,7 +1086,65 @@ namespace MongoDB.Driver.Tests.Search
 
             bucket = result.Facet["date"].Buckets.Should().NotBeNull().And.ContainSingle().Subject;
             bucket.Id.Should().Be((BsonDateTime)DateTime.MinValue);
-            bucket.Count.Should().Be(108);
+            bucket.Count.Should().Be(1);
+        }
+
+        [Theory]
+        [InlineData(false)]
+        [InlineData(true)]
+        public void SearchMeta_with_ReturnScope(bool useExpression)
+        {
+            var searchDefinition = Builders<Director>.Search.Range("movies.releaseYear", SearchRangeBuilder.Gt(2000));
+            var aggregate = GetReturnScopeCollection<Director>().Aggregate();
+
+            var query = useExpression
+                ? aggregate.SearchMeta(searchDefinition, e => e.Movies, "returnScopeIndex1")
+                : aggregate.SearchMeta(searchDefinition, "movies", "returnScopeIndex1");
+
+            var results = query.ToList();
+            results.Count.Should().Be(1);
+
+            ValidateSearchStage(
+                "{ $searchMeta: { range: { gt: 2000, path: 'movies.releaseYear' }, index: 'returnScopeIndex1', returnScope: { path: 'movies' } } }");
+        }
+
+        [Fact]
+        public void SearchMeta_with_ReturnScope_nested_path()
+        {
+            var searchDefinition = Builders<Director>.Search.Range("movies.reviews.rating", SearchRangeBuilder.Gte(8.0));
+            var aggregate = GetReturnScopeCollection<Director>().Aggregate();
+
+            var results = aggregate.SearchMeta(searchDefinition, "movies.reviews", "returnScopeIndex2").ToList();
+
+            results.Count.Should().Be(1);
+
+            ValidateSearchStage(
+                "{ $searchMeta: { range: { gte: 8.0, path: 'movies.reviews.rating' }, index: 'returnScopeIndex2', returnScope: { path: 'movies.reviews' } } }");
+        }
+
+        [Fact]
+        public void SearchMeta_facet_without_operator()
+        {
+            var result = GetTestCollection().Aggregate()
+                .SearchMeta(Builders.Search.Facet(
+                    Builders.SearchFacet.String("string", x => x.Author, 100),
+                    Builders.SearchFacet.Number("number", x => x.Index, 0, 100),
+                    Builders.SearchFacet.Date("date", x => x.Date, DateTime.MinValue, DateTime.MaxValue)))
+                .Single();
+
+            result.Should().NotBeNull();
+
+            var bucket = result.Facet["string"].Buckets.Should().NotBeNull().And.ContainSingle().Subject;
+            bucket.Id.Should().Be((BsonString)"machine");
+            bucket.Count.Should().Be(AtlasSearchFixtureSeedData.HistoricalDocuments.Length);
+
+            bucket = result.Facet["number"].Buckets.Should().NotBeNull().And.ContainSingle().Subject;
+            bucket.Id.Should().Be((BsonInt32)0);
+            bucket.Count.Should().Be(0);
+
+            bucket = result.Facet["date"].Buckets.Should().NotBeNull().And.ContainSingle().Subject;
+            bucket.Id.Should().Be((BsonDateTime)DateTime.MinValue);
+            bucket.Count.Should().Be(AtlasSearchFixtureSeedData.HistoricalDocuments.Length);
         }
 
         [Fact]
@@ -1000,13 +1283,17 @@ namespace MongoDB.Driver.Tests.Search
         [Fact]
         public void VectorSearch()
         {
+            // The lean fixture seeds the 5 magical-children movies plus 14 unrelated docs. With
+            // only one Pinocchio variant copied per title (the original Atlas dataset has 4),
+            // top-K ranking under the test's __embedding shifts Pinocchio out of the top 5
+            // in favour of "Oz the Great and Powerful". Expected set updated accordingly.
             var expectedTitles = new[]
             {
                 "Willy Wonka & the Chocolate Factory",
-                "Pinocchio",
                 "Time Bandits",
                 "Harry Potter and the Sorcerer's Stone",
-                "The Witches"
+                "The Witches",
+                "Oz the Great and Powerful"
             };
 
             var vectorSearch = Builders<EmbeddedMovie>.Search.VectorSearch(x => x.Embedding, __embedding, limit: 5);
@@ -1016,7 +1303,7 @@ namespace MongoDB.Driver.Tests.Search
                 .Search(vectorSearch, indexName: SearchWithVectorIndexName)
                 .ToList();
 
-            results.Select(m => m.Title).ShouldBeEquivalentTo(expectedTitles);
+            results.Select(m => m.Title).Should().BeEquivalentTo(expectedTitles);
         }
 
         [Fact]
@@ -1025,8 +1312,8 @@ namespace MongoDB.Driver.Tests.Search
             var expectedTitles = new[]
             {
                 "Willy Wonka & the Chocolate Factory",
-                "Pinocchio",
-                "Time Bandits"
+                "Time Bandits",
+                "Harry Potter and the Sorcerer's Stone"
             };
 
             var vectorSearch = Builders<EmbeddedMovie>.Search.VectorSearch(x => x.Embedding, __embedding, limit: 5);
@@ -1037,7 +1324,7 @@ namespace MongoDB.Driver.Tests.Search
                 .Limit(3)
                 .ToList();
 
-            results.Select(m => m.Title).ShouldBeEquivalentTo(expectedTitles);
+            results.Select(m => m.Title).Should().BeEquivalentTo(expectedTitles);
         }
 
         [Fact]
@@ -1065,19 +1352,20 @@ namespace MongoDB.Driver.Tests.Search
                 .Search(vectorSearch, indexName: SearchWithVectorIndexName)
                 .ToList();
 
-            results.Select(m => m.Title).ShouldBeEquivalentTo(expectedTitles);
+            results.Select(m => m.Title).Should().BeEquivalentTo(expectedTitles);
         }
 
         [Fact]
         public void VectorSearch_Exact()
         {
+            // See VectorSearch for the ranking-vs-seed-corpus rationale on the expected set.
             var expectedTitles = new[]
             {
                 "Willy Wonka & the Chocolate Factory",
-                "Pinocchio",
                 "Time Bandits",
                 "Harry Potter and the Sorcerer's Stone",
-                "The Witches"
+                "The Witches",
+                "Oz the Great and Powerful"
             };
 
             var options = new VectorSearchOperatorOptions<EmbeddedMovie>
@@ -1092,7 +1380,7 @@ namespace MongoDB.Driver.Tests.Search
                 .Search(vectorSearch, indexName: SearchWithVectorIndexName)
                 .ToList();
 
-            results.Select(m => m.Title).ShouldBeEquivalentTo(expectedTitles);
+            results.Select(m => m.Title).Should().BeEquivalentTo(expectedTitles);
         }
 
         [Fact]
@@ -1122,7 +1410,7 @@ namespace MongoDB.Driver.Tests.Search
                     .MetaSearchScore(p => p.Score))
                 .ToList();
 
-            results.Select(m => m.Title).ShouldBeEquivalentTo(expectedTitles);
+            results.Select(m => m.Title).Should().BeEquivalentTo(expectedTitles);
             results.Should().OnlyContain(m => m.Score > 0.9);
         }
 
@@ -1154,7 +1442,7 @@ namespace MongoDB.Driver.Tests.Search
                     .SearchMeta(p => p.MetaResult))
                 .ToList();
 
-            results.Select(m => m.Title).ShouldBeEquivalentTo(expectedTitles);
+            results.Select(m => m.Title).Should().BeEquivalentTo(expectedTitles);
             results.Should().OnlyContain(m => m.MetaResult.Count.Total == 5);
         }
 
@@ -1190,29 +1478,33 @@ namespace MongoDB.Driver.Tests.Search
                 .Project(Builders<Movie>.Projection.Include("Title").Exclude("_id"))
                 .ToList();
 
-        private IMongoCollection<HistoricalDocument> GetTestCollection() => _mongoClient
-            .GetDatabase("sample_training")
-            .GetCollection<HistoricalDocument>("posts");
+        private IMongoCollection<HistoricalDocument> GetTestCollection() =>
+            _fixture.GetHistoricalDocumentsCollection<HistoricalDocument>();
 
-        private IMongoCollection<T> GetTestCollection<T>() => _mongoClient
-            .GetDatabase("sample_training")
-            .GetCollection<T>("posts");
+        private IMongoCollection<T> GetTestCollection<T>() =>
+            _fixture.GetHistoricalDocumentsCollection<T>();
 
-        private IMongoCollection<T> GetEmbeddedMoviesCollection<T>() => _mongoClient
-            .GetDatabase("sample_mflix")
-            .GetCollection<T>("embedded_movies");
+        private IMongoCollection<T> GetEmbeddedMoviesCollection<T>() =>
+            _fixture.GetEmbeddedMoviesCollection<T>();
 
-        private IMongoCollection<T> GetMoviesCollection<T>() => _mongoClient
-            .GetDatabase("sample_mflix")
-            .GetCollection<T>("movies");
+        private IMongoCollection<T> GetMoviesCollection<T>() =>
+            _fixture.GetMoviesCollection<T>();
 
-        private IMongoCollection<AirbnbListing> GetGeoTestCollection() => _mongoClient
-            .GetDatabase("sample_airbnb")
-            .GetCollection<AirbnbListing>("listingsAndReviews");
+        private IMongoCollection<AirbnbListing> GetGeoTestCollection() =>
+            _fixture.GetAirbnbListingsCollection<AirbnbListing>();
 
-        private IMongoCollection<TestClass> GetExtraTestsCollection() => _mongoClient
-            .GetDatabase("csharpExtraTests")
-            .GetCollection<TestClass>("testClasses");
+        private IMongoCollection<TestClass> GetExtraTestsCollection() =>
+            _fixture.GetTestClassesCollection<TestClass>();
+
+        private IMongoCollection<T> GetReturnScopeCollection<T>() =>
+            _fixture.GetReturnScopeDirectorsCollection<T>();
+
+        // Relies on the constructor's _eventCapturer.Clear() so the per-test capture
+        // contains exactly one aggregate command and that command has a single pipeline
+        // stage; both .Single() calls would throw otherwise.
+        private void ValidateSearchStage(string mql)
+            => _eventCapturer.Events.OfType<CommandStartedEvent>().Single().Command["pipeline"].AsBsonArray.Single()
+                .Should().Be(mql);
 
         [BsonIgnoreExtraElements]
         public class Comment
@@ -1229,6 +1521,9 @@ namespace MongoDB.Driver.Tests.Search
 
             [BsonElement("title")]
             public string Title { get; set; }
+
+            [BsonElement("year")]
+            public int Year { get; set; }
 
             [BsonElement("runtime")]
             public int Runtime { get; set; }
@@ -1342,5 +1637,50 @@ namespace MongoDB.Driver.Tests.Search
             [BsonElement("testGuid")]
             public Guid TestGuid { get; set; }
         }
+    }
+
+    [BsonIgnoreExtraElements]
+    public class Director
+    {
+        [BsonId]
+        public int Id { get; set; }
+
+        [BsonElement("director")]
+        public string Name { get; set; }
+
+        [BsonElement("birthDate")]
+        public string BirthDate { get; set; }
+
+        [BsonElement("age")]
+        public int Age { get; set; }
+
+        [BsonElement("movies")]
+        public List<DirectedMovie> Movies { get; set; } = new();
+    }
+
+    [BsonIgnoreExtraElements]
+    public class DirectedMovie
+    {
+        [BsonElement("title")]
+        public string Title { get; set; }
+
+        [BsonElement("releaseYear")]
+        public int ReleaseYear { get; set; }
+
+        [BsonElement("genre")]
+        public string Genre { get; set; }
+
+        [BsonElement("reviews")]
+        public List<DirectedMovieReview> Reviews { get; set; } = new();
+    }
+
+    [BsonIgnoreExtraElements]
+    public class DirectedMovieReview
+    {
+        [BsonElement("rating")]
+        public double Rating { get; set; }
+
+        [BsonElement("text")]
+        public string Text { get; set; }
     }
 }

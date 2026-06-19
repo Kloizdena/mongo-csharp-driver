@@ -35,13 +35,15 @@ namespace MongoDB.Driver.Linq.Linq3Implementation.Translators.ExpressionToAggreg
             return UnwrapIfWrapped(expression, translatedExpression);
         }
 
+        public static AstExpression TranslateAndEnsureRepresentation(TranslationContext context, Expression expression, BsonType representation)
+        {
+            var translation = Translate(context, expression);
+            SerializationHelper.EnsureSerializerRepresentation(expression, translation.Serializer, representation);
+            return translation.Ast;
+        }
+
         public static TranslatedExpression TranslateWithoutUnwrapping(TranslationContext context, Expression expression)
         {
-            if (!context.HasResultSerializer(expression))
-            {
-                throw new ExpressionNotSupportedException(expression, because: "we were unable to determine which serializer to use for the result");
-            }
-
             switch (expression.NodeType)
             {
                 case ExpressionType.Convert:
@@ -157,9 +159,9 @@ namespace MongoDB.Driver.Linq.Linq3Implementation.Translators.ExpressionToAggreg
         public static TranslatedExpression TranslateLambdaBody(
             TranslationContext context,
             LambdaExpression lambdaExpression,
-            Symbol parameterSymbol)
+            params Symbol[] parameterSymbols)
         {
-            var lambdaContext = context.WithSymbol(parameterSymbol);
+            var lambdaContext = context.WithSymbols(parameterSymbols);
             var translatedBody = Translate(lambdaContext, lambdaExpression.Body);
 
             var lambdaReturnType = lambdaExpression.ReturnType;

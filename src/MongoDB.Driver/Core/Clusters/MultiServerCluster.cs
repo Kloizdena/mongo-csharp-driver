@@ -35,7 +35,7 @@ namespace MongoDB.Driver.Core.Clusters
         private volatile ElectionInfo _maxElectionInfo;
         private volatile string _replicaSetName;
         private readonly List<IClusterableServer> _servers;
-        private readonly object _serversLock = new object();
+        private readonly object _serversLock = new();
         private readonly InterlockedInt32 _state;
         private readonly object _updateClusterDescriptionLock = new();
 
@@ -71,6 +71,9 @@ namespace MongoDB.Driver.Core.Clusters
                     _monitorServersCancellationTokenSource.Cancel();
                     _monitorServersCancellationTokenSource.Dispose();
                     var clusterDescription = Description;
+
+                    ReleaseServerSessionPool();
+
                     lock (_serversLock)
                     {
                         foreach (var server in _servers.ToList())
@@ -592,14 +595,6 @@ namespace MongoDB.Driver.Core.Clusters
             {
                 server = _servers.FirstOrDefault(s => EndPointHelper.Equals(s.EndPoint, endPoint));
                 return server != null;
-            }
-        }
-
-        private void ThrowIfDisposed()
-        {
-            if (_state.Value == State.Disposed)
-            {
-                throw new ObjectDisposedException(GetType().Name);
             }
         }
 

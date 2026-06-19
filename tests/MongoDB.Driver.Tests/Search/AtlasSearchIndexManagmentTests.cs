@@ -28,11 +28,12 @@ using Xunit.Sdk;
 
 namespace MongoDB.Driver.Tests.Search
 {
-    [Category("AtlasSearchIndexHelpers")]
+    [Trait("Category", "AtlasSearch")]
+    [Collection(AtlasSearchCollection.Name)]
     public class AtlasSearchIndexManagementTests : LoggableTestClass
     {
         private const int Timeout = 5 * 60 * 1000;
-        private const int IndexesPollPeriod = 5000;
+        private const int IndexesPollPeriod = 10000; // Server polling is every 10 seconds
 
         private readonly IMongoCollection<BsonDocument> _collection;
         private readonly IMongoDatabase _database;
@@ -47,14 +48,12 @@ namespace MongoDB.Driver.Tests.Search
         private readonly BsonDocument _vectorIndexDefinition
             = BsonDocument.Parse("{ fields: [ { type: 'vector', path: 'plot_embedding', numDimensions: 1536, similarity: 'euclidean' } ] }");
 
-        public AtlasSearchIndexManagementTests(ITestOutputHelper testOutputHelper) : base(testOutputHelper)
+        public AtlasSearchIndexManagementTests(AtlasSearchFixture fixture, ITestOutputHelper testOutputHelper) : base(testOutputHelper)
         {
-            RequireEnvironment.Check().EnvironmentVariable("ATLAS_SEARCH_INDEX_HELPERS_TESTS_ENABLED");
+            RequireEnvironment.Check().EnvironmentVariable("ATLAS_SEARCH_TESTS_ENABLED");
+            RequireEnvironment.Check().EnvironmentVariable("ATLAS_SEARCH_URI");
 
-            // MONGODB_URI is set by atlas-expansion.yml
-            var atlasSearchUri = CoreTestConfiguration.ConnectionString.ToString();
-            _mongoClient = new MongoClient(atlasSearchUri);
-
+            _mongoClient = fixture.Client;
             _database = _mongoClient.GetDatabase("dotnet-test");
             var collectionName = GetRandomName();
 
@@ -70,7 +69,6 @@ namespace MongoDB.Driver.Tests.Search
         protected override void DisposeInternal()
         {
             _collection.Database.DropCollection(_collection.CollectionNamespace.CollectionName);
-            _mongoClient.Dispose();
         }
 
         [Theory(Timeout = Timeout)]
@@ -101,7 +99,7 @@ namespace MongoDB.Driver.Tests.Search
 
             indexNamesActual.Should().BeEquivalentTo(indexDefinition1.Name, indexDefinition2.Name);
 
-            var indexes = await GetIndexes(async, indexDefinition1.Name, indexDefinition2.Name);
+            var indexes = await GetIndexes(async, expectTimeout: false, indexDefinition1.Name, indexDefinition2.Name);
 
             indexes[0]["latestDefinition"].AsBsonDocument.Should().Be(indexDefinitionBson);
             indexes[1]["latestDefinition"].AsBsonDocument.Should().Be(indexDefinitionBson);
@@ -164,7 +162,7 @@ namespace MongoDB.Driver.Tests.Search
                 _collection.SearchIndexes.Update(indexName, indexNewDefinition);
             }
 
-            var updatedIndex = await GetIndexes(async, indexName);
+            var updatedIndex = await GetIndexes(async, expectTimeout: false, indexName);
             updatedIndex[0]["latestDefinition"].AsBsonDocument.Should().Be(indexNewDefinition);
         }
 
@@ -204,7 +202,7 @@ namespace MongoDB.Driver.Tests.Search
 
             indexNameCreated.Should().Be(indexName);
 
-            var indexes = await GetIndexes(async, indexName);
+            var indexes = await GetIndexes(async, expectTimeout: false, indexName);
             indexes[0]["latestDefinition"].AsBsonDocument.Should().Be(indexDefinitionBson);
         }
 
@@ -227,24 +225,21 @@ namespace MongoDB.Driver.Tests.Search
                 indexName3 = "test-search-index-case7-vector";
             }
 
-            var indexCreated = await CreateIndexAndValidate(indexName1, _indexDefinition, async);
-            indexCreated["type"].AsString.Should().Be("search");
+            await CreateIndexAndValidate(indexName1, _indexDefinition, async);
 
             var indexNameCreated = async
                 ? await _collection.SearchIndexes.CreateOneAsync(new CreateSearchIndexModel(indexName2, SearchIndexType.Search, _indexDefinition))
                 : _collection.SearchIndexes.CreateOne(new CreateSearchIndexModel(indexName2, SearchIndexType.Search, _indexDefinition));
             indexNameCreated.Should().Be(indexName2);
 
-            var indexCreated2 = await GetIndexes(async, indexName2);
-            indexCreated2[0]["type"].AsString.Should().Be("search");
+            await GetIndexes(async, expectTimeout: false, indexName2);
 
             indexNameCreated = async
                 ? await _collection.SearchIndexes.CreateOneAsync(new CreateSearchIndexModel(indexName3, SearchIndexType.VectorSearch, _vectorIndexDefinition))
                 : _collection.SearchIndexes.CreateOne(new CreateSearchIndexModel(indexName3, SearchIndexType.VectorSearch, _vectorIndexDefinition));
             indexNameCreated.Should().Be(indexName3);
 
-            var indexCreated3 = await GetIndexes(async, indexName3);
-            indexCreated3[0]["type"].AsString.Should().Be("vectorSearch");
+            await GetIndexes(async, expectTimeout: false, indexName3);
         }
 
         [Theory(Timeout = Timeout)]
@@ -301,8 +296,7 @@ namespace MongoDB.Driver.Tests.Search
 
             createdName.Should().Be(indexName);
 
-            var index = (await GetIndexes(async, indexName))[0];
-            index["type"].AsString.Should().Be("search");
+            var index = (await GetIndexes(async, expectTimeout: false, indexName))[0];
 
             var mappings = index["latestDefinition"].AsBsonDocument["mappings"].AsBsonDocument;
             mappings["dynamic"].AsBoolean.Should().Be(false);
@@ -333,8 +327,7 @@ namespace MongoDB.Driver.Tests.Search
 
             createdName.Should().Be(indexName);
 
-            var index = (await GetIndexes(async, indexName))[0];
-            index["type"].AsString.Should().Be("vectorSearch");
+            var index = (await GetIndexes(async, expectTimeout: false, indexName))[0];
 
             var fields = index["latestDefinition"].AsBsonDocument["fields"].AsBsonArray;
             fields.Count.Should().Be(1);
@@ -365,8 +358,7 @@ namespace MongoDB.Driver.Tests.Search
 
             createdName.Should().Be(indexName);
 
-            var index = (await GetIndexes(async, indexName))[0];
-            index["type"].AsString.Should().Be("vectorSearch");
+            var index = (await GetIndexes(async, expectTimeout: false, indexName))[0];
 
             var fields = index["latestDefinition"].AsBsonDocument["fields"].AsBsonArray;
             fields.Count.Should().Be(1);
@@ -379,6 +371,45 @@ namespace MongoDB.Driver.Tests.Search
 
             indexField.Contains("quantization").Should().Be(false);
             indexField.Contains("hnswOptions").Should().Be(false);
+        }
+
+        [Theory(Timeout = Timeout)]
+        [ParameterAttributeData]
+        public async Task Can_create_Atlas_vector_index_with_flat_indexing_method(
+            [Values(false, true)] bool async)
+        {
+            var indexName = "vector-flat" + (async ? "-async" : "");
+
+            var indexModel = new CreateVectorSearchIndexModel<EntityWithVector>(
+                e => e.Floats, indexName, VectorSimilarity.Cosine, dimensions: 2)
+            {
+                IndexingMethod = VectorIndexingMethod.Flat
+            };
+
+            indexModel = indexModel.WithIncludedStoredFields(e => e.SomeText);
+
+            var collection = _database.GetCollection<EntityWithVector>(_collection.CollectionNamespace.CollectionName);
+            var createdName = async
+                ? await collection.SearchIndexes.CreateOneAsync(indexModel)
+                : collection.SearchIndexes.CreateOne(indexModel);
+
+            createdName.Should().Be(indexName);
+
+            var index = (await GetIndexes(async, expectTimeout: false, indexName))[0];
+
+            var indexDefinition = index["latestDefinition"].AsBsonDocument;
+            var fields = indexDefinition["fields"].AsBsonArray;
+            fields.Count.Should().Be(1);
+
+            var indexField = fields[0].AsBsonDocument;
+            indexField["type"].AsString.Should().Be("vector");
+            indexField["path"].AsString.Should().Be("Floats");
+            indexField["numDimensions"].AsInt32.Should().Be(2);
+            indexField["similarity"].AsString.Should().Be("cosine");
+            indexField["indexingMethod"].AsString.Should().Be("flat");
+
+            var included = indexDefinition["storedSource"].AsBsonDocument["include"].AsBsonArray;
+            included.Select(b => b.AsString).Should().Contain("SomeText");
         }
 
         [Theory(Timeout = Timeout)]
@@ -400,6 +431,8 @@ namespace MongoDB.Driver.Tests.Search
                 Quantization = VectorQuantization.Scalar,
             };
 
+            indexModel = indexModel.WithIncludedStoredFields(e => e.SomeText, e => e.Filter3);
+
             var collection = _database.GetCollection<EntityWithVector>(_collection.CollectionNamespace.CollectionName);
             var createdName = async
                 ? await collection.SearchIndexes.CreateOneAsync(indexModel)
@@ -407,10 +440,12 @@ namespace MongoDB.Driver.Tests.Search
 
             createdName.Should().Be(indexName);
 
-            var index = (await GetIndexes(async, indexName))[0];
-            index["type"].AsString.Should().Be("vectorSearch");
+            var index = (await GetIndexes(async, expectTimeout: false, indexName))[0];
 
-            var fields = index["latestDefinition"].AsBsonDocument["fields"].AsBsonArray;
+            var indexDefinition = index["latestDefinition"].AsBsonDocument;
+            indexDefinition.Contains("nestedRoot").Should().Be(false);
+
+            var fields = indexDefinition["fields"].AsBsonArray;
             fields.Count.Should().Be(4);
 
             var indexField = fields[0].AsBsonDocument;
@@ -428,6 +463,12 @@ namespace MongoDB.Driver.Tests.Search
                 filterField["type"].AsString.Should().Be("filter");
                 filterField["path"].AsString.Should().Be($"Filter{i}");
             }
+
+            var storedSource = indexDefinition["storedSource"].AsBsonDocument;
+            var included = storedSource["include"].AsBsonArray;
+            included.Count.Should().Be(2);
+            included.Select(b => b.AsString).Should().Contain("SomeText");
+            included.Select(b => b.AsString).Should().Contain("Filter3");
         }
 
         [Theory(Timeout = Timeout)]
@@ -444,6 +485,8 @@ namespace MongoDB.Driver.Tests.Search
                 dimensions: 4,
                 "f1", "f2", "f3");
 
+            indexModel = indexModel.WithExcludedStoredFields("Floats", "SomeText");
+
             var collection = _database.GetCollection<EntityWithVector>(_collection.CollectionNamespace.CollectionName);
             var createdName = async
                 ? await collection.SearchIndexes.CreateOneAsync(indexModel)
@@ -451,10 +494,12 @@ namespace MongoDB.Driver.Tests.Search
 
             createdName.Should().Be(indexName);
 
-            var index = (await GetIndexes(async, indexName))[0];
-            index["type"].AsString.Should().Be("vectorSearch");
+            var index = (await GetIndexes(async, expectTimeout: false, indexName))[0];
 
-            var fields = index["latestDefinition"].AsBsonDocument["fields"].AsBsonArray;
+            var indexDefinition = index["latestDefinition"].AsBsonDocument;
+            indexDefinition.Contains("nestedRoot").Should().Be(false);
+
+            var fields = indexDefinition["fields"].AsBsonArray;
             fields.Count.Should().Be(4);
 
             var indexField = fields[0].AsBsonDocument;
@@ -472,6 +517,111 @@ namespace MongoDB.Driver.Tests.Search
                 filterField["type"].AsString.Should().Be("filter");
                 filterField["path"].AsString.Should().Be($"f{i}");
             }
+
+            var storedSource = indexDefinition["storedSource"].AsBsonDocument;
+            var excluded = storedSource["exclude"].AsBsonArray;
+            excluded.Count.Should().Be(2);
+            excluded[0].AsString.Should().Be("Floats");
+            excluded[1].AsString.Should().Be("SomeText");
+        }
+
+        [Theory(Timeout = Timeout)]
+        [ParameterAttributeData]
+        public async Task Can_create_Atlas_vector_index_for_nested_field(
+            [Values(false, true)] bool async)
+        {
+            var indexName = "vector-nested" + (async ? "-async" : "");
+
+            var indexModel = new CreateVectorSearchIndexModel<EntityWithVector>(
+                e => e.NestedEntity.NestedFloats,
+                indexName,
+                VectorSimilarity.Cosine,
+                dimensions: 512,
+                e => e.Filter1, e => e.Filter2, e => e.Filter3, e => e.NestedEntity.NestedFilter1,
+                e => e.NestedEntity.NestedFilter2, e => e.NestedEntity.NestedFilter3)
+            {
+                HnswMaxEdges = 18,
+                HnswNumEdgeCandidates = 102,
+                Quantization = VectorQuantization.Scalar,
+            };
+
+            var collection = _database.GetCollection<EntityWithVector>(_collection.CollectionNamespace.CollectionName);
+            var createdName = async
+                ? await collection.SearchIndexes.CreateOneAsync(indexModel)
+                : collection.SearchIndexes.CreateOne(indexModel);
+
+            createdName.Should().Be(indexName);
+
+            var index = (await GetIndexes(async, expectTimeout: false, indexName))[0];
+
+            var indexDefinition = index["latestDefinition"].AsBsonDocument;
+            indexDefinition["nestedRoot"].AsString.Should().Be("NestedEntity");
+
+            var fields = indexDefinition["fields"].AsBsonArray;
+            fields.Count.Should().Be(7);
+
+            var indexField = fields[0].AsBsonDocument;
+            indexField["type"].AsString.Should().Be("vector");
+            indexField["path"].AsString.Should().Be("NestedEntity.NestedFloats");
+            indexField["numDimensions"].AsInt32.Should().Be(512);
+            indexField["similarity"].AsString.Should().Be("cosine");
+            indexField["quantization"].AsString.Should().Be("scalar");
+            indexField["hnswOptions"].AsBsonDocument["maxEdges"].AsInt32.Should().Be(18);
+            indexField["hnswOptions"].AsBsonDocument["numEdgeCandidates"].AsInt32.Should().Be(102);
+
+            for (var i = 1; i <= 6; i++)
+            {
+                var filterField = fields[i].AsBsonDocument;
+                filterField["type"].AsString.Should().Be("filter");
+                filterField["path"].AsString.Should().Be(i <= 3 ? $"Filter{i}" : $"NestedEntity.NestedFilter{i - 3}");
+            }
+        }
+
+        [Theory(Timeout = Timeout)]
+        [ParameterAttributeData]
+        public async Task Can_create_Atlas_vector_index_for_nested_field_with_strings(
+            [Values(false, true)] bool async)
+        {
+            var indexName = "vector-nested-strings" + (async ? "-async" : "");
+
+            var indexModel = new CreateVectorSearchIndexModel<EntityWithVector>(
+                "NestedEntity.NestedFloats",
+                indexName,
+                VectorSimilarity.Euclidean,
+                dimensions: 512,
+                "Filter1", "Filter2", "Filter3", "NestedEntity.NestedFilter1", "NestedEntity.NestedFilter2",
+                "NestedEntity.NestedFilter3");
+
+            var collection = _database.GetCollection<EntityWithVector>(_collection.CollectionNamespace.CollectionName);
+            var createdName = async
+                ? await collection.SearchIndexes.CreateOneAsync(indexModel)
+                : collection.SearchIndexes.CreateOne(indexModel);
+
+            createdName.Should().Be(indexName);
+
+            var index = (await GetIndexes(async, expectTimeout: false, indexName))[0];
+
+            var indexDefinition = index["latestDefinition"].AsBsonDocument;
+            indexDefinition["nestedRoot"].AsString.Should().Be("NestedEntity");
+
+            var fields = indexDefinition["fields"].AsBsonArray;
+            fields.Count.Should().Be(7);
+
+            var indexField = fields[0].AsBsonDocument;
+            indexField["type"].AsString.Should().Be("vector");
+            indexField["path"].AsString.Should().Be("NestedEntity.NestedFloats");
+            indexField["numDimensions"].AsInt32.Should().Be(512);
+            indexField["similarity"].AsString.Should().Be("euclidean");
+
+            indexField.Contains("quantization").Should().Be(false);
+            indexField.Contains("hnswOptions").Should().Be(false);
+
+            for (var i = 1; i <= 6; i++)
+            {
+                var filterField = fields[i].AsBsonDocument;
+                filterField["type"].AsString.Should().Be("filter");
+                filterField["path"].AsString.Should().Be(i <= 3 ? $"Filter{i}" : $"NestedEntity.NestedFilter{i - 3}");
+            }
         }
 
         [Theory(Timeout = Timeout)]
@@ -479,7 +629,7 @@ namespace MongoDB.Driver.Tests.Search
         public async Task Can_create_autoEmbed_vector_index_for_required_only_options(
             [Values(false, true)] bool async)
         {
-            SkipTests();
+            RequireEnvironment.Check().EnvironmentVariable("AUTO_EMBEDDING_TESTS_ENABLED");
 
             var indexName = "auto-embed-required" + (async ? "-async" : "");
 
@@ -492,10 +642,12 @@ namespace MongoDB.Driver.Tests.Search
 
             createdName.Should().Be(indexName);
 
-            var index = (await GetIndexes(async, indexName))[0];
-            index["type"].AsString.Should().Be("vectorSearch");
+            var index = (await GetIndexes(async, expectTimeout: true, indexName))[0];
 
-            var fields = index["latestDefinition"].AsBsonDocument["fields"].AsBsonArray;
+            var indexDefinition = index["latestDefinition"].AsBsonDocument;
+            indexDefinition.Contains("nestedRoot").Should().Be(false);
+
+            var fields = indexDefinition["fields"].AsBsonArray;
             fields.Count.Should().Be(1);
 
             var indexField = fields[0].AsBsonDocument;
@@ -514,7 +666,7 @@ namespace MongoDB.Driver.Tests.Search
         public async Task Can_create_autoEmbed_vector_index_for_all_options(
             [Values(false, true)] bool async)
         {
-            SkipTests();
+            RequireEnvironment.Check().EnvironmentVariable("AUTO_EMBEDDING_TESTS_ENABLED");
 
             var indexName = "auto-embed-all" + (async ? "-async" : "");
 
@@ -531,10 +683,12 @@ namespace MongoDB.Driver.Tests.Search
 
             createdName.Should().Be(indexName);
 
-            var index = (await GetIndexes(async, indexName))[0];
-            index["type"].AsString.Should().Be("vectorSearch");
+            var index = (await GetIndexes(async, expectTimeout: true, indexName))[0];
 
-            var fields = index["latestDefinition"].AsBsonDocument["fields"].AsBsonArray;
+            var indexDefinition = index["latestDefinition"].AsBsonDocument;
+            indexDefinition.Contains("nestedRoot").Should().Be(false);
+
+            var fields = indexDefinition["fields"].AsBsonArray;
             fields.Count.Should().Be(1);
 
             var indexField = fields[0].AsBsonDocument;
@@ -543,9 +697,10 @@ namespace MongoDB.Driver.Tests.Search
             indexField["model"].AsString.Should().Be("voyage-4");
             indexField["modality"].AsString.Should().Be("text");
 
-            indexField.Contains("quantization").Should().Be(false);
-            indexField.Contains("numDimensions").Should().Be(false);
             indexField.Contains("similarity").Should().Be(false);
+            indexField.Contains("quantization").Should().Be(false);
+            indexField.Contains("hnswOptions").Should().Be(false);
+            indexField.Contains("compression").Should().Be(false);
         }
 
         [Theory(Timeout = Timeout)]
@@ -553,7 +708,7 @@ namespace MongoDB.Driver.Tests.Search
         public async Task Can_create_autoEmbed_vector_index_with_filters_as_text(
             [Values(false, true)] bool async)
         {
-            SkipTests();
+            RequireEnvironment.Check().EnvironmentVariable("AUTO_EMBEDDING_TESTS_ENABLED");
 
             var indexName = "auto-embed-filters-text" + (async ? "-async" : "");
 
@@ -563,6 +718,8 @@ namespace MongoDB.Driver.Tests.Search
                 "voyage-4",
                 "Filter1", "Filter2", "Filter3");
 
+            indexModel = indexModel.WithExcludedStoredFields("Floats", "SomeText");
+
             var collection = _database.GetCollection<EntityWithVector>(_collection.CollectionNamespace.CollectionName);
             var createdName = async
                 ? await collection.SearchIndexes.CreateOneAsync(indexModel)
@@ -570,10 +727,12 @@ namespace MongoDB.Driver.Tests.Search
 
             createdName.Should().Be(indexName);
 
-            var index = (await GetIndexes(async, indexName))[0];
-            index["type"].AsString.Should().Be("vectorSearch");
+            var index = (await GetIndexes(async, expectTimeout: true, indexName))[0];
 
-            var fields = index["latestDefinition"].AsBsonDocument["fields"].AsBsonArray;
+            var indexDefinition = index["latestDefinition"].AsBsonDocument;
+            indexDefinition.Contains("nestedRoot").Should().Be(false);
+
+            var fields = indexDefinition["fields"].AsBsonArray;
             fields.Count.Should().Be(4);
 
             var indexField = fields[0].AsBsonDocument;
@@ -592,6 +751,12 @@ namespace MongoDB.Driver.Tests.Search
             indexField.Contains("quantization").Should().Be(false);
             indexField.Contains("hnswOptions").Should().Be(false);
             indexField.Contains("compression").Should().Be(false);
+
+            var storedSource = indexDefinition["storedSource"].AsBsonDocument;
+            var excluded = storedSource["exclude"].AsBsonArray;
+            excluded.Count.Should().Be(2);
+            excluded[0].AsString.Should().Be("Floats");
+            excluded[1].AsString.Should().Be("SomeText");
         }
 
         [Theory(Timeout = Timeout)]
@@ -599,7 +764,7 @@ namespace MongoDB.Driver.Tests.Search
         public async Task Can_create_autoEmbed_vector_index_with_filters_as_expressions(
             [Values(false, true)] bool async)
         {
-            SkipTests();
+            RequireEnvironment.Check().EnvironmentVariable("AUTO_EMBEDDING_TESTS_ENABLED");
 
             var indexName = "auto-embed-filters-expressions" + (async ? "-async" : "");
 
@@ -609,6 +774,8 @@ namespace MongoDB.Driver.Tests.Search
                 "voyage-4",
                 e => e.Filter1, e => e.Filter2, e => e.Filter3);
 
+            indexModel = indexModel.WithIncludedStoredFields(e => e.SomeText, e => e.Filter3);
+
             var collection = _database.GetCollection<EntityWithVector>(_collection.CollectionNamespace.CollectionName);
             var createdName = async
                 ? await collection.SearchIndexes.CreateOneAsync(indexModel)
@@ -616,10 +783,12 @@ namespace MongoDB.Driver.Tests.Search
 
             createdName.Should().Be(indexName);
 
-            var index = (await GetIndexes(async, indexName))[0];
-            index["type"].AsString.Should().Be("vectorSearch");
+            var index = (await GetIndexes(async, expectTimeout: true, indexName))[0];
 
-            var fields = index["latestDefinition"].AsBsonDocument["fields"].AsBsonArray;
+            var indexDefinition = index["latestDefinition"].AsBsonDocument;
+            indexDefinition.Contains("nestedRoot").Should().Be(false);
+
+            var fields = indexDefinition["fields"].AsBsonArray;
             fields.Count.Should().Be(4);
 
             var indexField = fields[0].AsBsonDocument;
@@ -638,6 +807,12 @@ namespace MongoDB.Driver.Tests.Search
             indexField.Contains("quantization").Should().Be(false);
             indexField.Contains("hnswOptions").Should().Be(false);
             indexField.Contains("compression").Should().Be(false);
+
+            var storedSource = indexDefinition["storedSource"].AsBsonDocument;
+            var included = storedSource["include"].AsBsonArray;
+            included.Count.Should().Be(2);
+            included.Select(b => b.AsString).Contains("Filter3").Should().Be(true);
+            included.Select(b => b.AsString).Contains("SomeText").Should().Be(true);
         }
 
         private class EntityWithVector
@@ -648,6 +823,16 @@ namespace MongoDB.Driver.Tests.Search
             public string Filter2 { get; set; }
             public int Filter3 { get; set; }
             public string SomeText { get; set; }
+            public NestedEntityWithVector NestedEntity { get; set; }
+        }
+
+        private class NestedEntityWithVector
+        {
+            public float[] NestedFloats { get; set; }
+            public bool NestedFilter1 { get; set; }
+            public string NestedFilter2 { get; set; }
+            public int NestedFilter3 { get; set; }
+            public string NestedText { get; set; }
         }
 
         private static string CreateIndexName(string baseName, bool async, bool includeFields)
@@ -673,15 +858,14 @@ namespace MongoDB.Driver.Tests.Search
 
             indexNameActual.Should().Be(indexName);
 
-            var result = await GetIndexes(async, indexName);
+            var result = await GetIndexes(async, expectTimeout: false, indexName);
             return result[0];
         }
 
-        private async Task<BsonDocument[]> GetIndexes(bool async, params string[] indexNames)
+        private async Task<BsonDocument[]> GetIndexes(bool async, bool? expectTimeout = null, params string[] indexNames)
         {
             BsonDocument[] indexesFiltered = null!;
             var timeoutCount = 2;
-            bool? expectTimeout = null;
             while (expectTimeout != true || --timeoutCount >= 0)
             {
                 List<BsonDocument> indexes;
@@ -725,7 +909,5 @@ namespace MongoDB.Driver.Tests.Search
             var result = BsonTypeMapper.MapToDotNetValue(value);
             return (T)result;
         }
-
-        private void SkipTests() => throw new SkipException("Test skipped because of CSHARP-5840.");
     }
 }

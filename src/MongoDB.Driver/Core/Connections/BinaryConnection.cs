@@ -123,7 +123,7 @@ namespace MongoDB.Driver.Core.Connections
                 }
 
                 // connection has been idle for too long
-                if (_settings.MaxIdleTime.TotalMilliseconds > -1 && now > _lastUsedAtUtc.Add(_settings.MaxIdleTime))
+                if (_settings.MaxIdleTime.TotalMilliseconds > 0 && now > _lastUsedAtUtc.Add(_settings.MaxIdleTime))
                 {
                     return true;
                 }
@@ -155,7 +155,11 @@ namespace MongoDB.Driver.Core.Connections
             {
                 _failedEventHasBeenRaised = true;
                 _eventLogger.LogAndPublish(new ConnectionFailedEvent(_connectionId, exception));
-                _commandEventHelper.ConnectionFailed(_connectionId, _description?.ServiceId, exception, IsInitializing);
+
+                if (_commandEventHelper.ShouldCallConnectionFailed)
+                {
+                    _commandEventHelper.ConnectionFailed(_connectionId, _description?.ServiceId, exception, IsInitializing);
+                }
             }
         }
 

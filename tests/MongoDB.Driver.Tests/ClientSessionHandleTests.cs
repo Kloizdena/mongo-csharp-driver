@@ -487,8 +487,6 @@ namespace MongoDB.Driver.Tests
         [InlineData(new[] { false, false }, new[] { WithTransactionErrorState.UnknownTransactionCommitResult, WithTransactionErrorState.UnknownTransactionCommitResult, WithTransactionErrorState.NoError }, false /*Should exception be thrown*/, 1, false)]
         [InlineData(new[] { false, true }, new[] { WithTransactionErrorState.UnknownTransactionCommitResult, WithTransactionErrorState.UnknownTransactionCommitResult }, true /*Should exception be thrown*/, 1, false)]
 
-        [InlineData(new[] { false, false }, new[] { WithTransactionErrorState.UnknownTransactionCommitResult, WithTransactionErrorState.UnknownTransactionCommitResult, WithTransactionErrorState.NoError }, false /*Should exception be thrown*/, 1, false)]
-
         // async
         [InlineData(null, new[] { WithTransactionErrorState.NoError }, false /*Should exception be thrown*/, 1, true)]
         [InlineData(null, new[] { WithTransactionErrorState.TransientTransactionError, WithTransactionErrorState.NoError }, false /*Should exception be thrown*/, 2, true)]
@@ -500,8 +498,6 @@ namespace MongoDB.Driver.Tests
 
         [InlineData(new[] { false, false }, new[] { WithTransactionErrorState.UnknownTransactionCommitResult, WithTransactionErrorState.UnknownTransactionCommitResult, WithTransactionErrorState.NoError }, false /*Should exception be thrown*/, 1, true)]
         [InlineData(new[] { false, true }, new[] { WithTransactionErrorState.UnknownTransactionCommitResult, WithTransactionErrorState.UnknownTransactionCommitResult }, true /*Should exception be thrown*/, 1, true)]
-
-        [InlineData(new[] { false, false }, new[] { WithTransactionErrorState.UnknownTransactionCommitResult, WithTransactionErrorState.UnknownTransactionCommitResult, WithTransactionErrorState.NoError }, false /*Should exception be thrown*/, 1, true)]
         public void WithTransaction_commit_after_callback_processing_should_be_processed_with_expected_result(
             bool[] isRetryAttemptsWithTimeout, // the array length should be the same with a number of failed attempts from `commitTransactionErrorStates`
             WithTransactionErrorState[] commitTransactionErrorStates,
@@ -719,7 +715,7 @@ namespace MongoDB.Driver.Tests
             IClock clock = null,
             IRandom random = null)
         {
-            client ??= Mock.Of<IMongoClient>();
+            client ??= Mock.Of<IMongoClient>(c => c.Settings == new MongoClientSettings());
             options ??= new ClientSessionOptions();
             coreSession ??= CreateCoreSession(options: options.ToCore());
             clock ??= SystemClock.Instance;

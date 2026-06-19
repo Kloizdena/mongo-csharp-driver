@@ -18,12 +18,10 @@ using System.Linq;
 using System.Linq.Expressions;
 using MongoDB.Bson;
 using MongoDB.Bson.Serialization;
-using MongoDB.Driver.Core.Misc;
 using MongoDB.Driver.Linq.Linq3Implementation;
 using MongoDB.Driver.Linq.Linq3Implementation.Ast.Optimizers;
 using MongoDB.Driver.Linq.Linq3Implementation.Ast.Stages;
 using MongoDB.Driver.Linq.Linq3Implementation.Misc;
-using MongoDB.Driver.Linq.Linq3Implementation.SerializerFinders;
 using MongoDB.Driver.Linq.Linq3Implementation.Translators;
 using MongoDB.Driver.Linq.Linq3Implementation.Translators.ExpressionToAggregationExpressionTranslators;
 using MongoDB.Driver.Linq.Linq3Implementation.Translators.ExpressionToFilterTranslators;
@@ -72,7 +70,8 @@ namespace MongoDB.Driver.Linq
             LambdaExpression expression,
             IBsonSerializer<TDocument> documentSerializer,
             IBsonSerializerRegistry serializerRegistry,
-            ExpressionTranslationOptions translationOptions)
+            ExpressionTranslationOptions translationOptions,
+            string subPathRoot)
         {
             expression = (LambdaExpression)LinqExpressionPreprocessor.Preprocess(expression);
             var parameter = expression.Parameters.Single();
@@ -82,7 +81,9 @@ namespace MongoDB.Driver.Linq
             var body = RemovePossibleConvertToObject(expression.Body);
             var fieldTranslation = ExpressionToFilterFieldTranslator.Translate(context, body);
 
-            return new RenderedFieldDefinition(fieldTranslation.Ast.Path, fieldTranslation.Serializer);
+            var fieldName = RenderedFieldDefinition.RemoveSubPathRoot(fieldTranslation.Ast.Path, subPathRoot);
+
+            return new RenderedFieldDefinition(fieldName, fieldTranslation.Serializer);
 
             static Expression RemovePossibleConvertToObject(Expression expression)
             {
@@ -102,7 +103,8 @@ namespace MongoDB.Driver.Linq
             IBsonSerializer<TDocument> documentSerializer,
             IBsonSerializerRegistry serializerRegistry,
             ExpressionTranslationOptions translationOptions,
-            bool allowScalarValueForArrayField)
+            bool allowScalarValueForArrayField,
+            string subPathRoot)
         {
             expression = (Expression<Func<TDocument, TField>>)LinqExpressionPreprocessor.Preprocess(expression);
             var parameter = expression.Parameters.Single();
@@ -115,7 +117,9 @@ namespace MongoDB.Driver.Linq
             var fieldSerializer = underlyingSerializer as IBsonSerializer<TField>;
             var valueSerializer = (IBsonSerializer<TField>)FieldValueSerializerHelper.GetSerializerForValueType(underlyingSerializer, serializerRegistry, typeof(TField), allowScalarValueForArrayField);
 
-            return new RenderedFieldDefinition<TField>(fieldTranslation.Ast.Path, fieldSerializer, valueSerializer, underlyingSerializer);
+            var fieldName = RenderedFieldDefinition.RemoveSubPathRoot(fieldTranslation.Ast.Path, subPathRoot);
+
+            return new RenderedFieldDefinition<TField>(fieldName, fieldSerializer, valueSerializer, underlyingSerializer);
         }
 
         internal static BsonDocument TranslateExpressionToElemMatchFilter<TElement>(
@@ -194,17 +198,8 @@ namespace MongoDB.Driver.Linq
                 AstProjectStage projectStage;
                 IBsonSerializer projectionSerializer;
 
-                var wireVersion = context.TranslationOptions.CompatibilityLevel.ToWireVersion();
-                if (forFind && !Feature.FindProjectionExpressions.IsSupported(wireVersion))
-                {
-                    projectStage = null;
-                    projectionSerializer = ClientSideProjectionDeserializer.Create(inputSerializer, expression);
-                }
-                else
-                {
-                    (projectStage, projectionSerializer) = ClientSideProjectionTranslator.CreateProjectSnippetsStage(context, expression, inputSerializer);
-                    projectStage = simplifier.VisitAndConvert(projectStage);
-                }
+                (projectStage, projectionSerializer) = ClientSideProjectionTranslator.CreateProjectSnippetsStage(context, expression, inputSerializer);
+                projectStage = simplifier.VisitAndConvert(projectStage);
 
                 var renderedProjection = projectStage?.Render()["$project"].AsBsonDocument;
                 return new RenderedProjectionDefinition<TOutput>(renderedProjection, (IBsonSerializer<TOutput>)projectionSerializer);
@@ -217,21 +212,9 @@ namespace MongoDB.Driver.Linq
             IBsonSerializerRegistry serializerRegistry,
             ExpressionTranslationOptions translationOptions)
         {
-            var parameter = expression.Parameters.Single();
-            var body = expression.Body;
-
-            var nodeSerializers = new SerializerMap();
-            nodeSerializers.AddSerializer(parameter, documentSerializer);
-            if (body.Type == typeof(TDocument))
-            {
-                nodeSerializers.AddSerializer(body, documentSerializer);
-            }
-            SerializerFinder.FindSerializers(expression, translationOptions, nodeSerializers);
-
-            var context = TranslationContext.Create(translationOptions, nodeSerializers); // do not partially evaluate expression
-            var symbol = context.CreateRootSymbol(parameter, documentSerializer);
-            context = context.WithSymbol(symbol);
-            var setStage = ExpressionToSetStageTranslator.Translate(context, documentSerializer, expression);
+            // Pass the expression through without pre-processing here; value expressions in the $set translation
+            // will be partially evaluated while the members translation by ExpressionToSetStageTranslator.
+            var setStage = ExpressionToSetStageTranslator.Translate(documentSerializer, expression, translationOptions);
             var simplifiedSetStage = AstSimplifier.SimplifyAndConvert(setStage);
             return simplifiedSetStage.Render().AsBsonDocument;
         }

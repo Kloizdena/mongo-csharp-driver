@@ -55,14 +55,14 @@ namespace MongoDB.Bson
         {
             if (bytes == null)
             {
-                throw new ArgumentNullException("bytes");
+                throw new ArgumentNullException(nameof(bytes));
             }
             if (bytes.Length != 12)
             {
-                throw new ArgumentException("Byte array must be 12 bytes long", "bytes");
+                throw new ArgumentException("Byte array must be 12 bytes long", nameof(bytes));
             }
 
-            FromSpan(bytes, out _a, out _b, out _c);
+            FromBytesSpan(bytes, out _a, out _b, out _c);
         }
 
         /// <summary>
@@ -72,7 +72,7 @@ namespace MongoDB.Bson
         /// <param name="index">The index into the byte array where the ObjectId starts.</param>
         internal ObjectId(ReadOnlySpan<byte> bytes, int index)
         {
-            FromSpan(bytes.Slice(index), out _a, out _b, out _c);
+            FromBytesSpan(bytes.Slice(index, 12), out _a, out _b, out _c);
         }
 
         /// <summary>
@@ -92,7 +92,7 @@ namespace MongoDB.Bson
         {
             if (value == null)
             {
-                throw new ArgumentNullException("value");
+                throw new ArgumentNullException(nameof(value));
             }
 
             Span<byte> bytes = stackalloc byte[12];
@@ -100,7 +100,7 @@ namespace MongoDB.Bson
             {
                 throw new FormatException("String should contain only hexadecimal digits.");
             }
-            FromSpan(bytes, out _a, out _b, out _c);
+            FromBytesSpan(bytes, out _a, out _b, out _c);
         }
 
         private ObjectId(int a, int b, int c)
@@ -243,7 +243,7 @@ namespace MongoDB.Bson
         {
             if (s == null)
             {
-                throw new ArgumentNullException("s");
+                throw new ArgumentNullException(nameof(s));
             }
 
             ObjectId objectId;
@@ -394,12 +394,12 @@ namespace MongoDB.Bson
             var secondsSinceEpoch = (long)Math.Floor((BsonUtils.ToUniversalTime(timestamp) - BsonConstants.UnixEpoch).TotalSeconds);
             if (secondsSinceEpoch < uint.MinValue || secondsSinceEpoch > uint.MaxValue)
             {
-                throw new ArgumentOutOfRangeException("timestamp");
+                throw new ArgumentOutOfRangeException(nameof(timestamp));
             }
             return (int)(uint)secondsSinceEpoch;
         }
 
-        private static void FromSpan(ReadOnlySpan<byte> bytes, out int a, out int b, out int c)
+        private static void FromBytesSpan(ReadOnlySpan<byte> bytes, out int a, out int b, out int c)
         {
             a = BinaryPrimitives.ReadInt32BigEndian(bytes);
             b = BinaryPrimitives.ReadInt32BigEndian(bytes.Slice(4));
@@ -489,19 +489,61 @@ namespace MongoDB.Bson
         /// Writes the ObjectId into a byte span.
         /// </summary>
         /// <param name="destination">The destination.</param>
-        public void ToByteSpan(Span<byte> destination)
+        /// <param name="offset">The offset.</param>
+        public void ToByteSpan(Span<byte> destination, int offset)
         {
             if (destination == null)
             {
-                throw new ArgumentNullException("destination");
+                throw new ArgumentNullException(nameof(destination));
             }
             if (12 > destination.Length)
             {
-                throw new ArgumentException("Not enough room in destination buffer.", "offset");
+                throw new ArgumentException("Not enough room in destination buffer.", nameof(offset));
+            }
+
+            ToByteSpan(destination.Slice(offset, 12));
+        }
+
+        /// <summary>
+        /// Converts the ObjectId to a byte buffer provided by the input span.
+        /// </summary>
+        /// <param name="destination">The destination byte span.</param>
+        /// <exception cref="ArgumentException">Not enough room in destination span.</exception>
+        public void ToByteSpan(Span<byte> destination)
+        {
+            if (destination.Length < 12)
+            {
+                throw new ArgumentException("Not enough room in destination span.", nameof(destination));
             }
             BinaryPrimitives.WriteInt32BigEndian(destination, _a);
             BinaryPrimitives.WriteInt32BigEndian(destination.Slice(4), _b);
             BinaryPrimitives.WriteInt32BigEndian(destination.Slice(8), _c);
+        }
+
+        /// <summary>
+        /// Fills a character span with the characters corresponding to the string representation of the value.
+        /// </summary>
+        /// <param name="destination">The span to fill the characters in.</param>
+        /// <exception cref="ArgumentException">Not enough room in destination span.</exception>
+        public void ToCharSpan(Span<char> destination)
+        {
+            if (destination.Length < 24)
+            {
+                throw new ArgumentException("Not enough room in destination span.", nameof(destination));
+            }
+            var uintSpan = MemoryMarshal.Cast<char, uint>(destination);
+            uintSpan[0] = BsonUtils.GetHexChars((byte)(_a >> 24));
+            uintSpan[1] = BsonUtils.GetHexChars((byte)(_a >> 16));
+            uintSpan[2] = BsonUtils.GetHexChars((byte)(_a >> 8));
+            uintSpan[3] = BsonUtils.GetHexChars((byte)_a);
+            uintSpan[4] = BsonUtils.GetHexChars((byte)(_b >> 24));
+            uintSpan[5] = BsonUtils.GetHexChars((byte)(_b >> 16));
+            uintSpan[6] = BsonUtils.GetHexChars((byte)(_b >> 8));
+            uintSpan[7] = BsonUtils.GetHexChars((byte)_b);
+            uintSpan[8] = BsonUtils.GetHexChars((byte)(_c >> 24));
+            uintSpan[9] = BsonUtils.GetHexChars((byte)(_c >> 16));
+            uintSpan[10] = BsonUtils.GetHexChars((byte)(_c >> 8));
+            uintSpan[11] = BsonUtils.GetHexChars((byte)_c);
         }
 
         /// <summary>
@@ -515,33 +557,8 @@ namespace MongoDB.Bson
 #else
             Span<char> chars = stackalloc char[24];
 #endif
-            WriteToSpan(chars);
+            ToCharSpan(chars);
             return new string(chars);
-        }
-
-        /// <summary>
-        /// Writes the string representation of the value into the target span
-        /// </summary>
-        /// <param name="span">the target span</param>
-        public void WriteToSpan(Span<char> span)
-        {
-            if (span.Length < 24)
-            {
-                throw new ArgumentException("Not enough room in destination span.", "offset");
-            }
-            var uintSpan = MemoryMarshal.Cast<char, uint>(span);
-            uintSpan[0] = BsonUtils.GetHexChars((byte)(_a >> 24));
-            uintSpan[1] = BsonUtils.GetHexChars((byte)(_a >> 16));
-            uintSpan[2] = BsonUtils.GetHexChars((byte)(_a >> 8));
-            uintSpan[3] = BsonUtils.GetHexChars((byte)_a);
-            uintSpan[4] = BsonUtils.GetHexChars((byte)(_b >> 24));
-            uintSpan[5] = BsonUtils.GetHexChars((byte)(_b >> 16));
-            uintSpan[6] = BsonUtils.GetHexChars((byte)(_b >> 8));
-            uintSpan[7] = BsonUtils.GetHexChars((byte)_b);
-            uintSpan[8] = BsonUtils.GetHexChars((byte)(_c >> 24));
-            uintSpan[9] = BsonUtils.GetHexChars((byte)(_c >> 16));
-            uintSpan[10] = BsonUtils.GetHexChars((byte)(_c >> 8));
-            uintSpan[11] = BsonUtils.GetHexChars((byte)_c);
         }
 
         // explicit IConvertible implementation

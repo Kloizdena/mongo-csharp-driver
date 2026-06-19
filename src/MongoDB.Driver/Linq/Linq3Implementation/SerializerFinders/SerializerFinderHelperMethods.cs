@@ -17,7 +17,9 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Linq.Expressions;
+using MongoDB.Bson;
 using MongoDB.Bson.Serialization;
+using MongoDB.Bson.Serialization.Options;
 using MongoDB.Bson.Serialization.Serializers;
 using MongoDB.Driver.Linq.Linq3Implementation.Misc;
 using MongoDB.Driver.Linq.Linq3Implementation.Serializers;
@@ -81,7 +83,21 @@ internal partial class SerializerFinderVisitor
             return UnknowableSerializer.Create(collectionType);
         }
 
-        var itemSerializer = collectionSerializer.GetItemSerializer();
+        IBsonSerializer itemSerializer;
+        if (collectionSerializer is IBsonDictionarySerializer dictionarySerializer &&
+            collectionSerializer is IBsonArraySerializer arraySerializer &&
+            !arraySerializer.TryGetItemSerializationInfo(out _))
+        {
+            var representation = dictionarySerializer.DictionaryRepresentation == DictionaryRepresentation.ArrayOfArrays
+                ? BsonType.Array
+                : BsonType.Document;
+            itemSerializer = KeyValuePairSerializer.Create(representation, dictionarySerializer.KeySerializer, dictionarySerializer.ValueSerializer);
+        }
+        else
+        {
+            itemSerializer = collectionSerializer.GetItemSerializer();
+        }
+
         return CreateCollectionSerializerFromItemSerializer(collectionType, itemSerializer);
     }
 
@@ -235,20 +251,32 @@ internal partial class SerializerFinderVisitor
     private bool IsItemSerializerKnown(Expression node, out IBsonSerializer itemSerializer)
     {
         if (IsKnown(node, out var nodeSerializer) &&
-            nodeSerializer is IBsonArraySerializer arraySerializer &&
-            arraySerializer.TryGetItemSerializationInfo(out var itemSerializationInfo))
+            nodeSerializer is IBsonArraySerializer arraySerializer)
         {
-            itemSerializer = itemSerializationInfo.Serializer;
-            return true;
+            if (arraySerializer.TryGetItemSerializationInfo(out var itemSerializationInfo))
+            {
+                itemSerializer = itemSerializationInfo.Serializer;
+                return true;
+            }
+
+            if (nodeSerializer is IBsonDictionarySerializer dictionarySerializer)
+            {
+                var representation = dictionarySerializer.DictionaryRepresentation == DictionaryRepresentation.ArrayOfArrays
+                    ? BsonType.Array
+                    : BsonType.Document;
+                itemSerializer = KeyValuePairSerializer.Create(representation, dictionarySerializer.KeySerializer, dictionarySerializer.ValueSerializer);
+                return true;
+            }
         }
 
         itemSerializer = null;
         return false;
     }
 
-    private bool IsKnown(Expression node) => _nodeSerializers.IsKnown(node);
-
-    private bool IsKnown(Expression node, out IBsonSerializer nodeSerializer) => _nodeSerializers.IsKnown(node, out nodeSerializer);
+    private bool IsKnown(Expression node, out IBsonSerializer nodeSerializer)
+    {
+        return _nodeSerializers.IsKnown(node, out nodeSerializer) && nodeSerializer is not IUnknowableSerializer and not IIgnoreSubtreeSerializer;
+    }
 
     private bool IsNotKnown(Expression node) => _nodeSerializers.IsNotKnown(node);
 }

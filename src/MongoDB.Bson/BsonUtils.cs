@@ -144,12 +144,12 @@ namespace MongoDB.Bson
 #if NET5_0_OR_GREATER || NETSTANDARD2_1_OR_GREATER
             return string.Create(bytes.Length * 2, bytes, static (chars, bytes) =>
             {
-                ToHexChars(bytes.AsSpan(), chars);
+                HexConverter.ToHexChars(bytes.AsSpan(), chars);
             });
 #else
             var length = bytes.Length;
             var c = new char[length * 2];
-            ToHexChars(bytes, c.AsSpan());
+            HexConverter.ToHexChars(bytes, c.AsSpan());
             return new string(c);
 #endif
         }
@@ -162,16 +162,6 @@ namespace MongoDB.Bson
         internal static uint GetHexChars(byte byteValue)
         {
             return HexConverter.GetHexChars(byteValue);
-        }
-
-        /// <summary>
-        /// Converts a span of bytes to a span of hex characters.
-        /// </summary>
-        /// <param name="bytes">The input span of bytes.</param>
-        /// <param name="chars">The result span of characters.</param>
-        public static void ToHexChars(ReadOnlySpan<byte> bytes, Span<char> chars)
-        {
-            HexConverter.ToHexChars(bytes, chars);
         }
 
         /// <summary>

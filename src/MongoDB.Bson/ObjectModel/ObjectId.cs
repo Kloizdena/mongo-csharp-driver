@@ -46,12 +46,22 @@ namespace MongoDB.Bson
             : this(bytes.AsSpan())
         {
         }
-        // constructors
+
         /// <summary>
         /// Initializes a new instance of the ObjectId class.
         /// </summary>
         /// <param name="bytes">The bytes.</param>
-        public ObjectId(ReadOnlySpan<byte> bytes)
+        /// <param name="index">The index into the byte array where the ObjectId starts.</param>
+        internal ObjectId(ReadOnlySpan<byte> bytes, int index)
+        {
+            FromBytesSpan(bytes.Slice(index, 12), out _a, out _b, out _c);
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the ObjectId class.
+        /// </summary>
+        /// <param name="bytes">The bytes.</param>
+        internal ObjectId(ReadOnlySpan<byte> bytes)
         {
             if (bytes == null)
             {
@@ -68,27 +78,8 @@ namespace MongoDB.Bson
         /// <summary>
         /// Initializes a new instance of the ObjectId class.
         /// </summary>
-        /// <param name="bytes">The bytes.</param>
-        /// <param name="index">The index into the byte array where the ObjectId starts.</param>
-        internal ObjectId(ReadOnlySpan<byte> bytes, int index)
-        {
-            FromBytesSpan(bytes.Slice(index, 12), out _a, out _b, out _c);
-        }
-
-        /// <summary>
-        /// Initializes a new instance of the ObjectId class.
-        /// </summary>
         /// <param name="value">The value.</param>
         public ObjectId(string value)
-            : this(value is null ? throw new ArgumentNullException("value") : value.AsSpan())
-        {
-        }
-
-        /// <summary>
-        /// Initializes a new instance of the ObjectId class.
-        /// </summary>
-        /// <param name="value">The value.</param>
-        public ObjectId(ReadOnlySpan<char> value)
         {
             if (value == null)
             {
@@ -96,7 +87,7 @@ namespace MongoDB.Bson
             }
 
             Span<byte> bytes = stackalloc byte[12];
-            if (!TryFillBytes(value, bytes))
+            if (!TryFillBytes(value.AsSpan(), bytes))
             {
                 throw new FormatException("String should contain only hexadecimal digits.");
             }
@@ -313,6 +304,7 @@ namespace MongoDB.Bson
             BsonUtils.TryParseByte(chars[20], chars[21], out bytes[10]) &&
             BsonUtils.TryParseByte(chars[22], chars[23], out bytes[11]);
 
+
         // internal static methods
         internal static long CalculateRandomValue()
         {
@@ -483,25 +475,6 @@ namespace MongoDB.Bson
         public void ToByteArray(byte[] destination, int offset)
         {
             ToByteSpan(destination.AsSpan().Slice(offset));
-        }
-
-        /// <summary>
-        /// Writes the ObjectId into a byte span.
-        /// </summary>
-        /// <param name="destination">The destination.</param>
-        /// <param name="offset">The offset.</param>
-        public void ToByteSpan(Span<byte> destination, int offset)
-        {
-            if (destination == null)
-            {
-                throw new ArgumentNullException(nameof(destination));
-            }
-            if (12 > destination.Length)
-            {
-                throw new ArgumentException("Not enough room in destination buffer.", nameof(offset));
-            }
-
-            ToByteSpan(destination.Slice(offset, 12));
         }
 
         /// <summary>

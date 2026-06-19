@@ -43,7 +43,11 @@ namespace MongoDB.Bson
         /// </summary>
         /// <param name="bytes">The bytes.</param>
         public ObjectId(byte[] bytes)
-            : this(bytes.AsSpan())
+            : this(bytes == null
+                  ? throw new ArgumentNullException(nameof(bytes))
+                  : bytes.Length != 12
+                  ? throw new ArgumentException("Byte array must be 12 bytes long", nameof(bytes))
+                  : bytes.AsSpan())
         {
         }
 
@@ -60,19 +64,19 @@ namespace MongoDB.Bson
         /// <summary>
         /// Initializes a new instance of the ObjectId class.
         /// </summary>
-        /// <param name="bytes">The bytes.</param>
-        internal ObjectId(ReadOnlySpan<byte> bytes)
+        /// <param name="span">The span of bytes.</param>
+        internal ObjectId(ReadOnlySpan<byte> span)
         {
-            if (bytes == null)
+            if (span == null)
             {
-                throw new ArgumentNullException(nameof(bytes));
+                throw new ArgumentNullException(nameof(span));
             }
-            if (bytes.Length != 12)
+            if (span.Length != 12)
             {
-                throw new ArgumentException("Byte array must be 12 bytes long", nameof(bytes));
+                throw new ArgumentException("Span must be 12 bytes long", nameof(span));
             }
 
-            FromBytesSpan(bytes, out _a, out _b, out _c);
+            FromBytesSpan(span, out _a, out _b, out _c);
         }
 
         /// <summary>

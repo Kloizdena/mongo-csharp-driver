@@ -141,37 +141,17 @@ namespace MongoDB.Bson
                 throw new ArgumentNullException(nameof(bytes));
             }
 #endif
-            return ToHexString(bytes.AsMemory());
-        }
-
-        /// <summary>
-        /// Converts a memory of bytes to a hex string.
-        /// </summary>
-        /// <param name="bytes">The memory of bytes.</param>
-        /// <returns>A hex string.</returns>
-        public static string ToHexString(ReadOnlyMemory<byte> bytes)
-        {
 #if NET5_0_OR_GREATER || NETSTANDARD2_1_OR_GREATER
             return string.Create(bytes.Length * 2, bytes, static (chars, bytes) =>
             {
-                ToHexChars(bytes.Span, chars);
+                ToHexChars(bytes.AsSpan(), chars);
             });
 #else
-            return new string(ToHexChars(bytes.Span));
-#endif
-        }
-
-        /// <summary>
-        /// Converts a span of byte to a span of hex characters.
-        /// </summary>
-        /// <param name="bytes">The input span of bytes.</param>
-        /// <returns>An array of hex characters.</returns>
-        public static char[] ToHexChars(ReadOnlySpan<byte> bytes)
-        {
             var length = bytes.Length;
             var c = new char[length * 2];
             ToHexChars(bytes, c.AsSpan());
-            return c;
+            return new string(c);
+#endif
         }
 
         /// <summary>
@@ -299,7 +279,7 @@ namespace MongoDB.Bson
         /// <param name="value">The combined byte value</param>
         /// <returns>True if the hex characters were successfully parsed.</returns>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static bool TryParseByte(char c1, char c2, out byte value)
+        internal static bool TryParseByte(char c1, char c2, out byte value)
         {
             return HexParser.TryParseByte(c1, c2, out value);
         }
